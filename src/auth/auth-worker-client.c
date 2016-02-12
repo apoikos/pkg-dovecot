@@ -14,7 +14,6 @@
 #include "auth-request.h"
 #include "auth-worker-client.h"
 
-#include <stdlib.h>
 
 #define AUTH_WORKER_WARN_DISCONNECTED_LONG_CMD_SECS 30
 #define OUTBUF_THROTTLE_SIZE (1024*10)
@@ -374,6 +373,8 @@ lookup_user_callback(enum userdb_result result,
 		break;
 	case USERDB_RESULT_OK:
 		str_append(str, "OK\t");
+		str_append_tabescaped(str, auth_request->user);
+		str_append_c(str, '\t');
 		auth_fields_append(auth_request->userdb_reply, str, 0, 0);
 		if (auth_request->userdb_lookup_tempfailed)
 			str_append(str, "\ttempfail");

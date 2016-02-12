@@ -62,6 +62,7 @@ struct dsync_mailbox_importer {
 	uint32_t remote_first_recent_uid;
 	uint64_t remote_highest_modseq, remote_highest_pvt_modseq;
 	time_t sync_since_timestamp;
+	enum mailbox_transaction_flags transaction_flags;
 
 	enum mail_flags sync_flag;
 	const char *sync_keyword;
@@ -170,12 +171,12 @@ static void
 dsync_mailbox_import_transaction_begin(struct dsync_mailbox_importer *importer)
 {
 	const enum mailbox_transaction_flags ext_trans_flags =
-		MAILBOX_TRANSACTION_FLAG_SYNC |
+		importer->transaction_flags |
 		MAILBOX_TRANSACTION_FLAG_EXTERNAL |
 		MAILBOX_TRANSACTION_FLAG_ASSIGN_UIDS;
 
 	importer->trans = mailbox_transaction_begin(importer->box,
-						MAILBOX_TRANSACTION_FLAG_SYNC);
+						    importer->transaction_flags);
 	importer->ext_trans = mailbox_transaction_begin(importer->box,
 							ext_trans_flags);
 	importer->mail = mail_alloc(importer->trans, 0, NULL);
@@ -227,6 +228,9 @@ dsync_mailbox_import_init(struct mailbox *box,
 		else
 			importer->sync_keyword = p_strdup(pool, sync_flag);
 	}
+	importer->transaction_flags = MAILBOX_TRANSACTION_FLAG_SYNC;
+	if ((flags & DSYNC_MAILBOX_IMPORT_FLAG_NO_NOTIFY) != 0)
+		importer->transaction_flags |= MAILBOX_TRANSACTION_FLAG_NO_NOTIFY;
 
 	hash_table_create(&importer->import_guids, pool, 0, str_hash, strcmp);
 	hash_table_create_direct(&importer->import_uids, pool, 0);
@@ -402,18 +406,15 @@ dsync_attributes_cmp(const struct dsync_mailbox_attribute *attr,
 static int
 dsync_mailbox_import_attribute_real(struct dsync_mailbox_importer *importer,
 				    const struct dsync_mailbox_attribute *attr,
+				    const struct dsync_mailbox_attribute *local_attr,
 				    const char **result_r)
 {
-	struct dsync_mailbox_attribute *local_attr;
 	struct mail_attribute_value value;
 	int cmp;
 	bool ignore = FALSE;
 
 	i_assert(DSYNC_ATTR_HAS_VALUE(attr) || attr->deleted);
 
-	if (dsync_mailbox_import_lookup_attr(importer, attr->type,
-					     attr->key, &local_attr) < 0)
-		return -1;
 	if (attr->deleted &&
 	    (local_attr == NULL || !DSYNC_ATTR_HAS_VALUE(local_attr))) {
 		/* attribute doesn't exist on either side -> ignore */
@@ -474,11 +475,8 @@ dsync_mailbox_import_attribute_real(struct dsync_mailbox_importer *importer,
 			*result_r = "Value changed, but unknown which is newer - picking remote";
 		}
 	}
-	if (ignore) {
-		if (local_attr->value_stream != NULL)
-			i_stream_unref(&local_attr->value_stream);
+	if (ignore)
 		return 0;
-	}
 
 	memset(&value, 0, sizeof(value));
 	value.value = attr->value;
@@ -492,18 +490,25 @@ dsync_mailbox_import_attribute_real(struct dsync_mailbox_importer *importer,
 		/* the attributes aren't vital, don't fail everything just
 		   because of them. */
 	}
-	if (local_attr != NULL && local_attr->value_stream != NULL)
-		i_stream_unref(&local_attr->value_stream);
 	return 0;
 }
 
 int dsync_mailbox_import_attribute(struct dsync_mailbox_importer *importer,
 				   const struct dsync_mailbox_attribute *attr)
 {
-	const char *result;
+	struct dsync_mailbox_attribute *local_attr;
+	const char *result = "";
 	int ret;
 
-	ret = dsync_mailbox_import_attribute_real(importer, attr, &result);
+	if (dsync_mailbox_import_lookup_attr(importer, attr->type,
+					     attr->key, &local_attr) < 0)
+		ret = -1;
+	else {
+		ret = dsync_mailbox_import_attribute_real(importer, attr,
+							  local_attr, &result);
+		if (local_attr != NULL && local_attr->value_stream != NULL)
+			i_stream_unref(&local_attr->value_stream);
+	}
 	imp_debug(importer, "Import attribute %s: %s", attr->key,
 		  ret < 0 ? "failed" : result);
 	return ret;
@@ -2022,7 +2027,7 @@ dsync_mailbox_import_find_virtual_uids(struct dsync_mailbox_importer *importer)
 
 	importer->virtual_trans =
 		mailbox_transaction_begin(importer->virtual_all_box,
-					  MAILBOX_TRANSACTION_FLAG_SYNC);
+					  importer->transaction_flags);
 	search_ctx = mailbox_search_init(importer->virtual_trans, search_args,
 					 NULL, MAIL_FETCH_GUID, NULL);
 	mail_search_args_unref(&search_args);
@@ -2265,6 +2270,7 @@ dsync_mailbox_save_body(struct dsync_mailbox_importer *importer,
 	if (!remote_mail) {
 		/* the mail isn't remote yet. we were just trying to copy a
 		   local mail to avoid downloading the remote mail. */
+		mailbox_save_cancel(&save_ctx);
 		return FALSE;
 	}
 	if (mail->minimal_fields) {

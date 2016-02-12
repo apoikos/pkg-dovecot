@@ -3,6 +3,7 @@
 #include "lib.h"
 #include "restrict-access.h"
 #include "randgen.h"
+#include "hostpid.h"
 #include "env-util.h"
 #include "module-dir.h"
 #include "master-service.h"
@@ -82,13 +83,16 @@ static void main_deinit(void)
 
 int main(int argc, char *argv[])
 {
+	const enum master_service_flags service_flags =
+		MASTER_SERVICE_FLAG_UPDATE_PROCTITLE;
 	const struct setting_parser_info *set_roots[] = {
 		&dict_setting_parser_info,
 		NULL
 	};
 	const char *error;
 
-	master_service = master_service_init("dict", 0, &argc, &argv, "");
+	master_service = master_service_init("dict", service_flags,
+					     &argc, &argv, "");
 	if (master_getopt(master_service) > 0)
 		return FATAL_DEFAULT;
 
@@ -96,7 +100,7 @@ int main(int argc, char *argv[])
 						&error) < 0)
 		i_fatal("Error reading configuration: %s", error);
 
-	master_service_init_log(master_service, "dict: ");
+	master_service_init_log(master_service, t_strdup_printf("dict(%s): ", my_pid));
 	main_preinit();
 	master_service_set_die_callback(master_service, dict_die);
 

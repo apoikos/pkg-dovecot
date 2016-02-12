@@ -18,7 +18,6 @@
 #include "client-authenticate.h"
 #include "imap-proxy.h"
 
-#include <stdlib.h>
 
 void client_authenticate_get_capabilities(struct client *client, string_t *str)
 {
@@ -81,8 +80,12 @@ void imap_client_auth_result(struct client *client,
 		client_send_reply(client, IMAP_CMD_REPLY_BAD, text);
 		break;
 	case CLIENT_AUTH_RESULT_AUTHFAILED_REASON:
-		client_send_reply_code(client, IMAP_CMD_REPLY_NO,
-				       "ALERT", text);
+		if (text[0] == '[')
+			client_send_reply(client, IMAP_CMD_REPLY_NO, text);
+		else {
+			client_send_reply_code(client, IMAP_CMD_REPLY_NO,
+					       "ALERT", text);
+		}
 		break;
 	case CLIENT_AUTH_RESULT_AUTHZFAILED:
 		client_send_reply_code(client, IMAP_CMD_REPLY_NO,
@@ -177,8 +180,11 @@ int cmd_login(struct imap_client *imap_client, const struct imap_arg *args)
 	    !IMAP_ARG_IS_EOL(&args[2]))
 		return -1;
 
-	if (!client_check_plaintext_auth(client, TRUE))
+	if (!client_check_plaintext_auth(client, TRUE)) {
+		if (client->virtual_user == NULL)
+			client->virtual_user = i_strdup(user);
 		return 1;
+	}
 
 	/* authorization ID \0 authentication ID \0 pass */
 	plain_login = buffer_create_dynamic(pool_datastack_create(), 64);

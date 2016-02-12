@@ -34,8 +34,6 @@
 #include "commands.h"
 #include "lmtp-proxy.h"
 
-#include <stdlib.h>
-
 #define ERRSTR_TEMP_MAILBOX_FAIL "451 4.3.0 <%s> Temporary internal error"
 #define ERRSTR_TEMP_USERDB_FAIL_PREFIX "451 4.3.0 <%s> "
 #define ERRSTR_TEMP_USERDB_FAIL \
@@ -240,11 +238,18 @@ client_proxy_rcpt_parse_fields(struct lmtp_proxy_rcpt_settings *set,
 		else if (strcmp(key, "host") == 0)
 			set->host = value;
 		else if (strcmp(key, "port") == 0) {
-			set->port = atoi(value);
+			if (net_str2port(value, &set->port) < 0) {
+				i_error("proxy: Invalid port number %s", value);
+				return FALSE;
+			}
 			port_set = TRUE;
-		} else if (strcmp(key, "proxy_timeout") == 0)
-			set->timeout_msecs = atoi(value)*1000;
-		else if (strcmp(key, "protocol") == 0) {
+		} else if (strcmp(key, "proxy_timeout") == 0) {
+			if (str_to_uint(value, &set->timeout_msecs) < 0) {
+				i_error("proxy: Invalid proxy_timeout value %s", value);
+				return FALSE;
+			}
+			set->timeout_msecs *= 1000;
+		} else if (strcmp(key, "protocol") == 0) {
 			if (strcmp(value, "lmtp") == 0)
 				set->protocol = LMTP_CLIENT_PROTOCOL_LMTP;
 			else if (strcmp(value, "smtp") == 0) {
@@ -533,6 +538,17 @@ static void lmtp_address_translate(struct client *client, const char **address)
 	*address = str_c(username);
 }
 
+static void
+client_send_line_overquota(struct client *client,
+			   const struct mail_recipient *rcpt, const char *error)
+{
+	struct lda_settings *lda_set =
+		mail_storage_service_user_get_set(rcpt->service_user)[1];
+
+	client_send_line(client, "%s <%s> %s", lda_set->quota_full_tempfail ?
+			 "452 4.2.2" : "552 5.2.2", rcpt->address, error);
+}
+
 static int
 lmtp_rcpt_to_is_over_quota(struct client *client,
 			   const struct mail_recipient *rcpt)
@@ -559,8 +575,7 @@ lmtp_rcpt_to_is_over_quota(struct client *client,
 	if (ret < 0) {
 		errstr = mailbox_get_last_error(box, &error);
 		if (error == MAIL_ERROR_NOQUOTA) {
-			client_send_line(client, "552 5.2.2 <%s> %s",
-					 rcpt->address, errstr);
+			client_send_line_overquota(client, rcpt, errstr);
 			ret = 1;
 		}
 	}
@@ -671,6 +686,7 @@ int cmd_rcpt(struct client *client, const char *args)
 		client_send_line(client, "451 4.3.0 <%s> "
 			"Can't handle mixed proxy/non-proxy destinations",
 			address);
+		mail_storage_service_user_free(&rcpt->service_user);
 		return 0;
 	}
 
@@ -678,25 +694,25 @@ int cmd_rcpt(struct client *client, const char *args)
 
 	rcpt->address = p_strdup(client->state_pool, address);
 	rcpt->detail = p_strdup(client->state_pool, detail);
-	if ((ret = lmtp_rcpt_to_is_over_quota(client, rcpt)) < 0) {
-		client_send_line(client, ERRSTR_TEMP_MAILBOX_FAIL,
-				 rcpt->address);
+	if ((ret = lmtp_rcpt_to_is_over_quota(client, rcpt)) != 0) {
+		if (ret < 0) {
+			client_send_line(client, ERRSTR_TEMP_MAILBOX_FAIL,
+					 rcpt->address);
+		}
+		mail_storage_service_user_free(&rcpt->service_user);
 		return 0;
 	}
-	if (ret == 0) {
-		array_append(&client->state.rcpt_to, &rcpt, 1);
-		client_send_line(client, "250 2.1.5 OK");
-	}
+	array_append(&client->state.rcpt_to, &rcpt, 1);
+	client_send_line(client, "250 2.1.5 OK");
 
 	if (client->lmtp_set->lmtp_user_concurrency_limit > 0) {
 		const char *query = t_strconcat("LOOKUP\t",
 			master_service_get_name(master_service),
 			"/", str_tabescape(username), NULL);
 		lmtp_anvil_init();
+		client->state.anvil_queries++;
 		rcpt->anvil_query = anvil_client_query(anvil, query,
 					rcpt_anvil_lookup_callback, rcpt);
-		if (rcpt->anvil_query != NULL)
-			client->state.anvil_queries++;
 	}
 	return 0;
 }
@@ -863,10 +879,7 @@ client_deliver(struct client *client, const struct mail_recipient *rcpt,
 	} else if (storage != NULL) {
 		error = mail_storage_get_last_error(storage, &mail_error);
 		if (mail_error == MAIL_ERROR_NOQUOTA) {
-			client_send_line(client, "%s <%s> %s",
-					 dctx.set->quota_full_tempfail ?
-					 "452 4.2.2" : "552 5.2.2",
-					 rcpt->address, error);
+			client_send_line_overquota(client, rcpt, error);
 		} else {
 			client_send_line(client, "451 4.2.0 <%s> %s",
 					 rcpt->address, error);
@@ -1164,9 +1177,8 @@ static int client_input_add_file(struct client *client,
 	}
 
 	/* we just want the fd, unlink it */
-	if (unlink(str_c(path)) < 0) {
+	if (i_unlink(str_c(path)) < 0) {
 		/* shouldn't happen.. */
-		i_error("unlink(%s) failed: %m", str_c(path));
 		i_close_fd(&fd);
 		return -1;
 	}
@@ -1270,7 +1282,8 @@ int cmd_xclient(struct client *client, const char *args)
 {
 	const char *const *tmp;
 	struct ip_addr remote_ip;
-	unsigned int remote_port = 0, ttl = UINT_MAX, timeout_secs = 0;
+	in_port_t remote_port = 0;
+	unsigned int ttl = UINT_MAX, timeout_secs = 0;
 	bool args_ok = TRUE;
 
 	if (!client_is_trusted(client)) {
@@ -1283,8 +1296,7 @@ int cmd_xclient(struct client *client, const char *args)
 			if (net_addr2ip(*tmp + 5, &remote_ip) < 0)
 				args_ok = FALSE;
 		} else if (strncasecmp(*tmp, "PORT=", 5) == 0) {
-			if (str_to_uint(*tmp + 5, &remote_port) < 0 ||
-			    remote_port == 0 || remote_port > 65535)
+			if (net_str2port(*tmp + 5, &remote_port) < 0)
 				args_ok = FALSE;
 		} else if (strncasecmp(*tmp, "TTL=", 4) == 0) {
 			if (str_to_uint(*tmp + 4, &ttl) < 0)

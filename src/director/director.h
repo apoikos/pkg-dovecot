@@ -6,7 +6,7 @@
 
 #define DIRECTOR_VERSION_NAME "director"
 #define DIRECTOR_VERSION_MAJOR 1
-#define DIRECTOR_VERSION_MINOR 5
+#define DIRECTOR_VERSION_MINOR 7
 
 /* weak users supported in protocol */
 #define DIRECTOR_VERSION_WEAK_USERS 1
@@ -20,6 +20,10 @@
 #define DIRECTOR_VERSION_OPTIONS 5
 /* user tags supported */
 #define DIRECTOR_VERSION_TAGS 5
+/* up/down state is tracked */
+#define DIRECTOR_VERSION_UPDOWN 6
+/* user tag version 2 supported */
+#define DIRECTOR_VERSION_TAGS_V2 7
 
 /* Minimum time between even attempting to communicate with a director that
    failed due to a protocol error. */
@@ -36,9 +40,9 @@ struct director {
 
 	/* IP and port of this director. self_host->ip/port must equal these. */
 	struct ip_addr self_ip;
-	unsigned int self_port;
+	in_port_t self_port;
 
-	unsigned int test_port;
+	in_port_t test_port;
 
 	struct director_host *self_host;
 	/* left and right connections are set only after they have finished
@@ -99,7 +103,7 @@ extern bool director_debug;
    without specified port. */
 struct director *
 director_init(const struct director_settings *set,
-	      const struct ip_addr *listen_ip, unsigned int listen_port,
+	      const struct ip_addr *listen_ip, in_port_t listen_port,
 	      director_state_change_callback_t *callback);
 void director_deinit(struct director **dir);
 void director_find_self(struct director *dir);
@@ -113,7 +117,7 @@ void director_set_ring_unsynced(struct director *dir);
 void director_set_state_changed(struct director *dir);
 void director_sync_send(struct director *dir, struct director_host *host,
 			uint32_t seq, unsigned int minor_version,
-			unsigned int timestamp);
+			unsigned int timestamp, unsigned int hosts_hash);
 bool director_resend_sync(struct director *dir);
 
 void director_notify_ring_added(struct director_host *added_host,
@@ -124,6 +128,7 @@ void director_ring_remove(struct director_host *removed_host,
 void director_update_host(struct director *dir, struct director_host *src,
 			  struct director_host *orig_src,
 			  struct mail_host *host) ATTR_NULL(3);
+void director_resend_hosts(struct director *dir);
 void director_remove_host(struct director *dir, struct director_host *src,
 			  struct director_host *orig_src,
 			  struct mail_host *host) ATTR_NULL(2, 3);

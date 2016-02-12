@@ -2,7 +2,6 @@
 
 #include "lib.h"
 #include "fts-language.h"
-#include "fts-filter.h"
 #include "fts-filter-private.h"
 
 #ifdef HAVE_FTS_STEMMER
@@ -56,7 +55,7 @@ static int
 fts_filter_stemmer_snowball_create_stemmer(struct fts_filter_stemmer_snowball *sp,
 					   const char **error_r)
 {
-	sp->stemmer = sb_stemmer_new(sp->lang->name, NULL);
+	sp->stemmer = sb_stemmer_new(sp->lang->name, "UTF_8");
 	if (sp->stemmer == NULL) {
 		*error_r = t_strdup_printf(
 			"Creating a Snowball stemmer for language '%s' failed.",
@@ -117,15 +116,14 @@ fts_filter_stemmer_snowball_filter(struct fts_filter *filter ATTR_UNUSED,
 }
 
 #endif
-static const struct fts_filter_vfuncs snowball_stemmer_filter_vfuncs = {
-	fts_filter_stemmer_snowball_create,
-	fts_filter_stemmer_snowball_filter,
-	fts_filter_stemmer_snowball_destroy
-};
 
 static const struct fts_filter fts_filter_stemmer_snowball_real = {
 	.class_name = "snowball",
-	.v = &snowball_stemmer_filter_vfuncs
+	.v = {
+		fts_filter_stemmer_snowball_create,
+		fts_filter_stemmer_snowball_filter,
+		fts_filter_stemmer_snowball_destroy
+	}
 };
 
 const struct fts_filter *fts_filter_stemmer_snowball = &fts_filter_stemmer_snowball_real;

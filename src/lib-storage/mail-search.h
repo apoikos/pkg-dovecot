@@ -70,6 +70,8 @@ struct mail_search_modseq {
 };
 
 struct mail_search_arg {
+	/* NOTE: when adding new fields, make sure mail_search_arg_dup_one()
+	   and mail_search_arg_one_equals() are updated. */
 	struct mail_search_arg *next;
 
 	enum mail_search_arg_type type;
@@ -83,12 +85,15 @@ struct mail_search_arg {
 		enum mail_search_arg_flag search_flags;
 		enum mail_search_date_type date_type;
 		enum mail_thread_type thread_type;
-		struct mail_keywords *keywords;
 		struct mail_search_modseq *modseq;
-		struct mail_search_args *search_args;
 		struct mail_search_result *search_result;
-		struct imap_match_glob *mailbox_glob;
 	} value;
+	/* set by mail_search_args_init(): */
+	struct {
+		struct mail_search_args *search_args;
+		struct mail_keywords *keywords;
+		struct imap_match_glob *mailbox_glob;
+	} initialized;
 
         void *context;
 	const char *hdr_field_name; /* for SEARCH_HEADER* */
@@ -112,6 +117,9 @@ struct mail_search_args {
 	/* Stop mail_search_next() when finding a non-matching mail.
 	   (Could be useful when wanting to find only the oldest mails.) */
 	unsigned int stop_on_nonmatch:1;
+	/* fts plugin has already expanded the search args - no need to do
+	   it again. */
+	unsigned int fts_expanded:1;
 };
 
 #define ARG_SET_RESULT(arg, res) \
@@ -129,9 +137,18 @@ void mail_search_args_init(struct mail_search_args *args,
 			   struct mailbox *box, bool change_uidsets,
 			   const ARRAY_TYPE(seq_range) *search_saved_uidset)
 	ATTR_NULL(4);
-/* Free keywords. The args can initialized afterwards again if needed.
-   The args can be reused for other queries after calling this. */
+/* Initialize arg and its children. args is used for getting mailbox and
+   pool. */
+void mail_search_arg_init(struct mail_search_args *args,
+			  struct mail_search_arg *arg,
+			  bool change_uidsets,
+			  const ARRAY_TYPE(seq_range) *search_saved_uidset);
+/* Free memory allocated by mail_search_args_init(). The args can initialized
+   afterwards again if needed. The args can be reused for other queries after
+   calling this. */
 void mail_search_args_deinit(struct mail_search_args *args);
+/* Free arg and its children. */
+void mail_search_arg_deinit(struct mail_search_arg *arg);
 /* Convert sequence sets in args to UIDs. */
 void mail_search_args_seq2uid(struct mail_search_args *args);
 /* Returns TRUE if the two search arguments are fully compatible.
@@ -139,6 +156,13 @@ void mail_search_args_seq2uid(struct mail_search_args *args);
    messages depending on when the search is run. */
 bool mail_search_args_equal(const struct mail_search_args *args1,
 			    const struct mail_search_args *args2);
+/* Same as mail_search_args_equal(), but for individual mail_search_arg
+   structs. All the siblings of arg1 and arg2 are also compared. */
+bool mail_search_arg_equals(const struct mail_search_arg *arg1,
+			    const struct mail_search_arg *arg2);
+/* Same as mail_search_arg_equals(), but don't compare siblings. */
+bool mail_search_arg_one_equals(const struct mail_search_arg *arg1,
+				const struct mail_search_arg *arg2);
 
 void mail_search_args_ref(struct mail_search_args *args);
 void mail_search_args_unref(struct mail_search_args **args);
@@ -187,6 +211,9 @@ bool mail_search_args_to_imap(string_t *dest, const struct mail_search_arg *args
 /* Like mail_search_args_to_imap(), but append only a single arg. */
 bool mail_search_arg_to_imap(string_t *dest, const struct mail_search_arg *arg,
 			     const char **error_r);
+/* Write all args to dest string as cmdline/human compatible input. */
+void mail_search_args_to_cmdline(string_t *dest,
+				 const struct mail_search_arg *args);
 
 /* Serialization for search args' results. */
 void mail_search_args_result_serialize(const struct mail_search_args *args,

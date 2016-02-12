@@ -42,6 +42,8 @@ struct solr_fts_backend_update_context {
 	bool documents_added;
 };
 
+static const char *solr_escape_chars = "+-&|!(){}[]^\"~*?:\\/ ";
+
 static bool is_valid_xml_char(unichar_t chr)
 {
 	/* Valid characters in XML:
@@ -89,10 +91,8 @@ xml_encode_data(string_t *dest, const unsigned char *data, unsigned int len)
 				/* make sure the character is valid for XML
 				   so we don't get XML parser errors */
 				unsigned int char_len =
-					uni_utf8_char_bytes(data[i]);
-				if (i + char_len <= len &&
-				    uni_utf8_get_char_n(data + i, char_len, &chr) == 1 &&
-				    is_valid_xml_char(chr))
+					uni_utf8_get_char_n(data + i, len - i, &chr);
+				if (char_len > 0 && is_valid_xml_char(chr))
 					str_append_n(dest, data + i, char_len);
 				else {
 					str_append_n(dest, utf8_replacement_char,
@@ -141,18 +141,31 @@ static const char *solr_escape_id_str(const char *str)
 	return str_c(tmp);
 }
 
+static const char *solr_escape(const char *str)
+{
+	string_t *ret;
+	unsigned int i;
+
+	if (str[0] == '\0')
+		return "\"\"";
+
+	ret = t_str_new(strlen(str) + 16);
+	for (i = 0; str[i] != '\0'; i++) {
+		if (strchr(solr_escape_chars, str[i]) != NULL)
+			str_append_c(ret, '\\');
+		str_append_c(ret, str[i]);
+	}
+	return str_c(ret);
+}
+
 static void solr_quote(string_t *dest, const char *str)
 {
-	str_append_c(dest, '"');
-	str_append(dest, str_escape(str));
-	str_append_c(dest, '"');
+	str_append(dest, solr_escape(str));
 }
 
 static void solr_quote_http(string_t *dest, const char *str)
 {
-	str_append(dest, "%22");
-	http_url_escape_param(dest, str);
-	str_append(dest, "%22");
+	http_url_escape_param(dest, solr_escape(str));
 }
 
 static void fts_solr_set_default_ns(struct solr_fts_backend *backend)
@@ -308,10 +321,10 @@ fts_backend_solr_get_last_uid_fallback(struct solr_fts_backend *backend,
 	box_name = fts_box_get_root(box, &ns);
 
 	mailbox_get_open_status(box, STATUS_UIDVALIDITY, &status);
-	str_printfa(str, "uidv:%u+box:", status.uidvalidity);
+	str_printfa(str, "uidv:%u+AND+box:", status.uidvalidity);
 	solr_quote_http(str, box_name);
 	solr_add_ns_query_http(str, backend, ns);
-	str_append(str, "+user:");
+	str_append(str, "+AND+user:");
 	solr_quote_http(str, ns->user->username);
 
 	pool = pool_alloconly_create("solr last uid lookup", 1024);

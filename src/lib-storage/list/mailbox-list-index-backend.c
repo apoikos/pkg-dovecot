@@ -175,7 +175,7 @@ index_list_get_path(struct mailbox_list *_list, const char *name,
 				       T_MAIL_ERR_MAILBOX_NOT_FOUND(name));
 		ret = -1;
 	} else if (!mailbox_list_index_status(_list, view, seq, 0,
-					      &status, mailbox_guid) ||
+					      &status, mailbox_guid, NULL) ||
 		   guid_128_is_empty(mailbox_guid)) {
 		mailbox_list_set_error(_list, MAIL_ERROR_NOTFOUND,
 				       T_MAIL_ERR_MAILBOX_NOT_FOUND(name));
@@ -374,7 +374,8 @@ index_list_mailbox_create(struct mailbox *box,
 			if (ret <= 0) {
 				/* failed to add to list. rollback the backend
 				   mailbox creation */
-				(void)mailbox_delete(box);
+				if (mailbox_delete(box) < 0)
+					ret = -1;
 			}
 		}
 		list->create_mailbox_name = old_name;

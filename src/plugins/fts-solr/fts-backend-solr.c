@@ -26,6 +26,10 @@
    header fields as long as they're smaller than this */
 #define SOLR_HEADER_LINE_MAX_TRUNC_SIZE 1024
 
+#define SOLR_QUERY_MAX_MAILBOX_COUNT 10
+/* How often to flush indexing request to Solr before beginning a new one. */
+#define SOLR_MAIL_FLUSH_INTERVAL 1000
+
 struct solr_fts_backend {
 	struct fts_backend backend;
 	struct solr_connection *solr_conn;
@@ -49,6 +53,7 @@ struct solr_fts_backend_update_context {
 	ARRAY(struct solr_fts_field) fields;
 
 	uint32_t last_indexed_uid;
+	unsigned int mails_since_flush;
 
 	unsigned int tokenized_input:1;
 	unsigned int last_indexed_uid_set:1;
@@ -57,6 +62,8 @@ struct solr_fts_backend_update_context {
 	unsigned int expunges:1;
 	unsigned int truncate_header:1;
 };
+
+static const char *solr_escape_chars = "+-&|!(){}[]^\"~*?:\\/ ";
 
 static bool is_valid_xml_char(unichar_t chr)
 {
@@ -110,10 +117,8 @@ xml_encode_data_max(string_t *dest, const unsigned char *data, unsigned int len,
 				/* make sure the character is valid for XML
 				   so we don't get XML parser errors */
 				unsigned int char_len =
-					uni_utf8_char_bytes(data[i]);
-				if (i + char_len <= len &&
-				    uni_utf8_get_char_n(data + i, char_len, &chr) == 1 &&
-				    is_valid_xml_char(chr))
+					uni_utf8_get_char_n(data + i, len - i, &chr);
+				if (char_len > 0 && is_valid_xml_char(chr))
 					str_append_n(dest, data + i, char_len);
 				else {
 					str_append_n(dest, utf8_replacement_char,
@@ -140,11 +145,26 @@ static void xml_encode(string_t *dest, const char *str)
 	xml_encode_data(dest, (const unsigned char *)str, strlen(str));
 }
 
+static const char *solr_escape(const char *str)
+{
+	string_t *ret;
+	unsigned int i;
+
+	ret = t_str_new(strlen(str) + 16);
+	for (i = 0; str[i] != '\0'; i++) {
+		if (strchr(solr_escape_chars, str[i]) != NULL)
+			str_append_c(ret, '\\');
+		str_append_c(ret, str[i]);
+	}
+	return str_c(ret);
+}
+
 static void solr_quote_http(string_t *dest, const char *str)
 {
-	str_append(dest, "%22");
-	http_url_escape_param(dest, str);
-	str_append(dest, "%22");
+	if (str[0] != '\0')
+		http_url_escape_param(dest, solr_escape(str));
+	else
+		str_append(dest, "\"\"");
 }
 
 static struct fts_backend *fts_backend_solr_alloc(void)
@@ -202,7 +222,7 @@ get_last_uid_fallback(struct fts_backend *_backend, struct mailbox *box,
 	if (fts_mailbox_get_guid(box, &box_guid) < 0)
 		return -1;
 
-	str_printfa(str, "box:%s+user:", box_guid);
+	str_printfa(str, "box:%s+AND+user:", box_guid);
 	if (_backend->ns->owner != NULL)
 		solr_quote_http(str, _backend->ns->owner->username);
 	else
@@ -330,16 +350,18 @@ fts_backend_solr_doc_close(struct solr_fts_backend_update_context *ctx)
 }
 
 static int
-fts_backed_solr_build_commit(struct solr_fts_backend_update_context *ctx)
+fts_backed_solr_build_flush(struct solr_fts_backend_update_context *ctx)
 {
 	if (ctx->post == NULL)
 		return 0;
 
 	fts_backend_solr_doc_close(ctx);
 	str_append(ctx->cmd, "</add>");
+	ctx->mails_since_flush = 0;
 
 	solr_connection_post_more(ctx->post, str_data(ctx->cmd),
 				  str_len(ctx->cmd));
+	str_truncate(ctx->cmd, 0);
 	return solr_connection_post_end(&ctx->post);
 }
 
@@ -366,7 +388,7 @@ fts_backend_solr_update_deinit(struct fts_backend_update_context *_ctx)
 	const char *str;
 	int ret = _ctx->failed ? -1 : 0;
 
-	if (fts_backed_solr_build_commit(ctx) < 0)
+	if (fts_backed_solr_build_flush(ctx) < 0)
 		ret = -1;
 
 	if (ctx->documents_added || ctx->expunges) {
@@ -404,7 +426,7 @@ fts_backend_solr_update_set_mailbox(struct fts_backend_update_context *_ctx,
 	if (ctx->prev_uid != 0) {
 		/* flush solr between mailboxes, so we don't wrongly update
 		   last_uid before we know it has succeeded */
-		if (fts_backed_solr_build_commit(ctx) < 0)
+		if (fts_backed_solr_build_flush(ctx) < 0)
 			_ctx->failed = TRUE;
 		else if (!_ctx->failed)
 			fts_index_set_last_uid(ctx->cur_box, ctx->prev_uid);
@@ -465,10 +487,13 @@ fts_backend_solr_uid_changed(struct solr_fts_backend_update_context *ctx,
 	struct solr_fts_backend *backend =
 		(struct solr_fts_backend *)ctx->ctx.backend;
 
+	if (ctx->mails_since_flush++ >= SOLR_MAIL_FLUSH_INTERVAL) {
+		if (fts_backed_solr_build_flush(ctx) < 0)
+			ctx->ctx.failed = TRUE;
+	}
 	if (ctx->post == NULL) {
-		i_assert(ctx->prev_uid == 0);
-
-		ctx->cmd = str_new(default_pool, SOLR_CMDBUF_SIZE);
+		if (ctx->cmd == NULL)
+			ctx->cmd = str_new(default_pool, SOLR_CMDBUF_SIZE);
 		ctx->post = solr_connection_post_begin(backend->solr_conn);
 		str_append(ctx->cmd, "<add>");
 	} else {
@@ -615,8 +640,6 @@ static int fts_backend_solr_optimize(struct fts_backend *backend ATTR_UNUSED)
 
 static bool solr_need_escaping(const char *str)
 {
-	const char *solr_escape_chars = "+-&|!(){}[]^\"~*?:\\ ";
-
 	for (; *str != '\0'; str++) {
 		if (strchr(solr_escape_chars, *str) != NULL)
 			return TRUE;
@@ -629,10 +652,11 @@ static void solr_add_str_arg(string_t *str, struct mail_search_arg *arg)
 	/* currently we'll just disable fuzzy searching if there are any
 	   parameters that need escaping. solr doesn't seem to give good
 	   fuzzy results even if we did escape them.. */
-	if (!arg->fuzzy || solr_need_escaping(arg->value.str))
+	if (!arg->fuzzy || arg->value.str[0] == '\0' ||
+	    solr_need_escaping(arg->value.str))
 		solr_quote_http(str, arg->value.str);
 	else {
-		str_append(str, arg->value.str);
+		http_url_escape_param(str, arg->value.str);
 		str_append_c(str, '~');
 	}
 }
@@ -833,6 +857,7 @@ solr_search_multi(struct fts_backend *_backend, string_t *str,
 	struct mailbox *box;
 	const char *box_guid;
 	unsigned int i, len;
+	bool search_all_mailboxes;
 
 	/* use a separate filter query for selecting the mailbox. it shouldn't
 	   affect the score and there could be some caching benefits too. */
@@ -843,19 +868,26 @@ solr_search_multi(struct fts_backend *_backend, string_t *str,
 		str_append(str, "%22%22");
 
 	hash_table_create(&mailboxes, default_pool, 0, str_hash, strcmp);
-	str_append(str, "%2B(");
+	for (i = 0; boxes[i] != NULL; i++) ;
+	search_all_mailboxes = i > SOLR_QUERY_MAX_MAILBOX_COUNT;
+	if (!search_all_mailboxes)
+		str_append(str, "%2B(");
 	len = str_len(str);
+
 	for (i = 0; boxes[i] != NULL; i++) {
 		if (fts_mailbox_get_guid(boxes[i], &box_guid) < 0)
 			continue;
 
-		if (str_len(str) != len)
-			str_append(str, "+OR+");
-		str_printfa(str, "box:%s", box_guid);
+		if (!search_all_mailboxes) {
+			if (str_len(str) != len)
+				str_append(str, "+OR+");
+			str_printfa(str, "box:%s", box_guid);
+		}
 		hash_table_insert(mailboxes, t_strdup_noconst(box_guid),
 				  boxes[i]);
 	}
-	str_append_c(str, ')');
+	if (!search_all_mailboxes)
+		str_append_c(str, ')');
 
 	if (solr_connection_select(backend->solr_conn, str_c(str),
 				   result->pool, &solr_results) < 0) {
@@ -867,8 +899,10 @@ solr_search_multi(struct fts_backend *_backend, string_t *str,
 	for (i = 0; solr_results[i] != NULL; i++) {
 		box = hash_table_lookup(mailboxes, solr_results[i]->box_id);
 		if (box == NULL) {
-			i_warning("fts_solr: Lookup returned unexpected mailbox "
-				  "with guid=%s", solr_results[i]->box_id);
+			if (!search_all_mailboxes) {
+				i_warning("fts_solr: Lookup returned unexpected mailbox "
+					  "with guid=%s", solr_results[i]->box_id);
+			}
 			continue;
 		}
 		fts_result = array_append_space(&fts_results);

@@ -44,7 +44,6 @@
 #include "user-directory.h"
 #include "director-connection.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #define MAX_INBUF_SIZE 1024
@@ -79,6 +78,7 @@
    valid received SYNC timestamp, assume that we lost the director's restart
    notification and reset the last_sync_seq */
 #define DIRECTOR_SYNC_STALE_TIMESTAMP_RESET_SECS (60*2)
+#define DIRECTOR_MAX_CLOCK_DIFF_WARN_SECS 1
 
 #if DIRECTOR_CONNECTION_DONE_TIMEOUT_MSECS <= DIRECTOR_CONNECTION_PING_TIMEOUT_MSECS
 #  error DIRECTOR_CONNECTION_DONE_TIMEOUT_MSECS is too low
@@ -229,7 +229,8 @@ static void director_connection_assigned(struct director_connection *conn)
 		dir->sync_seq++;
 		director_set_ring_unsynced(dir);
 		director_sync_send(dir, dir->self_host, dir->sync_seq,
-				   DIRECTOR_VERSION_MINOR, ioloop_time);
+				   DIRECTOR_VERSION_MINOR, ioloop_time,
+				   mail_hosts_hash(dir->mail_hosts));
 	}
 	director_connection_set_ping_timeout(conn);
 }
@@ -345,7 +346,7 @@ static bool director_connection_assign_right(struct director_connection *conn)
 static bool
 director_args_parse_ip_port(struct director_connection *conn,
 			    const char *const *args,
-			    struct ip_addr *ip_r, unsigned int *port_r)
+			    struct ip_addr *ip_r, in_port_t *port_r)
 {
 	if (args[0] == NULL || args[1] == NULL) {
 		director_cmd_error(conn, "Missing IP+port parameters");
@@ -355,7 +356,7 @@ director_args_parse_ip_port(struct director_connection *conn,
 		director_cmd_error(conn, "Invalid IP address: %s", args[0]);
 		return FALSE;
 	}
-	if (str_to_uint(args[1], port_r) < 0) {
+	if (net_str2port(args[1], port_r) < 0) {
 		director_cmd_error(conn, "Invalid port: %s", args[1]);
 		return FALSE;
 	}
@@ -368,7 +369,7 @@ static bool director_cmd_me(struct director_connection *conn,
 	struct director *dir = conn->dir;
 	const char *connect_str;
 	struct ip_addr ip;
-	unsigned int port;
+	in_port_t port;
 	time_t next_comm_attempt;
 
 	if (!director_args_parse_ip_port(conn, args, &ip, &port))
@@ -387,6 +388,22 @@ static bool director_cmd_me(struct director_connection *conn,
 		return FALSE;
 	}
 	conn->me_received = TRUE;
+
+	if (args[2] != NULL) {
+		time_t remote_time;
+		int diff;
+
+		if (str_to_time(args[2], &remote_time) < 0) {
+			director_cmd_error(conn, "Invalid ME timestamp");
+			return FALSE;
+		}
+		diff = ioloop_time - remote_time;
+		if (diff > DIRECTOR_MAX_CLOCK_DIFF_WARN_SECS ||
+		    (diff < 0 && -diff > DIRECTOR_MAX_CLOCK_DIFF_WARN_SECS)) {
+			i_warning("Director %s clock differs from ours by %d secs",
+				  conn->name, diff);
+		}
+	}
 
 	timeout_remove(&conn->to_ping);
 	conn->to_ping = timeout_add(DIRECTOR_CONNECTION_DONE_TIMEOUT_MSECS,
@@ -506,6 +523,15 @@ director_user_refresh(struct director_connection *conn,
 			  "replacing host %s with %s", username_hash,
 			  net_ip2addr(&user->host->ip), net_ip2addr(&host->ip));
 		ret = TRUE;
+	} else if (user->kill_state != USER_KILL_STATE_NONE &&
+		   user->kill_state < USER_KILL_STATE_DELAY) {
+		/* user is still being moved - ignore conflicting host updates
+		   from other directors who don't yet know about the move. */
+		dir_debug("user refresh: %u is being moved, "
+			  "preserve its host %s instead of replacing with %s",
+			  username_hash, net_ip2addr(&user->host->ip),
+			  net_ip2addr(&host->ip));
+		host = user->host;
 	} else {
 		/* non-weak user received a non-weak update with
 		   conflicting host. this shouldn't happen. */
@@ -641,7 +667,7 @@ static bool director_cmd_director(struct director_connection *conn,
 {
 	struct director_host *host;
 	struct ip_addr ip;
-	unsigned int port;
+	in_port_t port;
 
 	if (!director_args_parse_ip_port(conn, args, &ip, &port))
 		return FALSE;
@@ -690,7 +716,7 @@ static bool director_cmd_director_remove(struct director_connection *conn,
 {
 	struct director_host *host;
 	struct ip_addr ip;
-	unsigned int port;
+	in_port_t port;
 
 	if (!director_args_parse_ip_port(conn, args, &ip, &port))
 		return FALSE;
@@ -737,12 +763,13 @@ director_cmd_is_seen(struct director_connection *conn,
 {
 	const char *const *args = *_args;
 	struct ip_addr ip;
-	unsigned int port, seq;
+	in_port_t port;
+	unsigned int seq;
 	struct director_host *host;
 
 	if (str_array_length(args) < 3 ||
 	    net_addr2ip(args[0], &ip) < 0 ||
-	    str_to_uint(args[1], &port) < 0 ||
+	    net_str2port(args[1], &port) < 0 ||
 	    str_to_uint(args[2], &seq) < 0) {
 		director_cmd_error(conn, "Invalid parameters");
 		return -1;
@@ -833,46 +860,90 @@ static bool ATTR_NULL(3)
 director_cmd_host_int(struct director_connection *conn, const char *const *args,
 		      struct director_host *dir_host)
 {
+	struct director_host *src_host = conn->host;
 	struct mail_host *host;
 	struct ip_addr ip;
-	const char *tag = "";
-	unsigned int vhost_count;
-	bool update;
+	const char *tag = "", *host_tag, *hostname = NULL;
+	unsigned int arg_count, vhost_count;
+	bool update, down = FALSE;
+	time_t last_updown_change = 0;
 
-	if (str_array_length(args) < 2 ||
+	arg_count = str_array_length(args);
+	if (arg_count < 2 ||
 	    net_addr2ip(args[0], &ip) < 0 ||
 	    str_to_uint(args[1], &vhost_count) < 0) {
 		director_cmd_error(conn, "Invalid parameters");
 		return FALSE;
 	}
-	if (args[2] != NULL)
+	if (arg_count >= 3)
 		tag = args[2];
+	if (arg_count >= 4) {
+		if ((args[3][0] != 'D' && args[3][0] != 'U') ||
+		    str_to_time(args[3]+1, &last_updown_change) < 0) {
+			director_cmd_error(conn, "Invalid updown parameters");
+			return FALSE;
+		}
+		down = args[3][0] == 'D';
+	}
+	if (arg_count >= 5)
+		hostname = args[4];
 	if (conn->ignore_host_events) {
 		/* remote is sending hosts in a handshake, but it doesn't have
 		   a completed ring and we do. */
 		i_assert(conn->handshake_sending_hosts);
 		return TRUE;
 	}
+	if (tag[0] != '\0' && conn->minor_version < DIRECTOR_VERSION_TAGS_V2) {
+		director_cmd_error(conn, "Received a host tag from older director version with incompatible tagging support");
+		return FALSE;
+	}
 
 	host = mail_host_lookup(conn->dir->mail_hosts, &ip);
 	if (host == NULL) {
-		host = mail_host_add_ip(conn->dir->mail_hosts, &ip, tag);
+		host = mail_host_add_hostname(conn->dir->mail_hosts,
+					      hostname, &ip, tag);
 		update = TRUE;
 	} else {
-		update = host->vhost_count != vhost_count;
-		if (strcmp(tag, host->tag) != 0) {
+		update = host->vhost_count != vhost_count ||
+			host->down != down;
+
+		host_tag = mail_host_get_tag(host);
+		if (strcmp(tag, host_tag) != 0) {
 			i_error("director(%s): Host %s changed tag from '%s' to '%s'",
 				conn->name, net_ip2addr(&host->ip),
-				host->tag, tag);
+				host_tag, tag);
 			mail_host_set_tag(host, tag);
 			update = TRUE;
+		}
+		if (update && host->desynced) {
+			vhost_count = I_MIN(vhost_count, host->vhost_count);
+			if (host->down != down) {
+				if (host->last_updown_change <= last_updown_change)
+					down = host->last_updown_change;
+			}
+			last_updown_change = I_MAX(last_updown_change,
+						   host->last_updown_change);
+			i_warning("director(%s): Host %s is being updated before previous update had finished - "
+				  "setting to state=%s vhosts=%u",
+				  conn->name, net_ip2addr(&host->ip),
+				  down ? "down" : "up", vhost_count);
+			/* make the change appear to come from us, so it
+			   reaches the full ring */
+			dir_host = NULL;
+			src_host = conn->dir->self_host;
 		}
 	}
 
 	if (update) {
-		mail_host_set_vhost_count(conn->dir->mail_hosts,
-					  host, vhost_count);
-		director_update_host(conn->dir, conn->host, dir_host, host);
+		mail_host_set_down(host, down, last_updown_change);
+		mail_host_set_vhost_count(host, vhost_count);
+		director_update_host(conn->dir, src_host, dir_host, host);
+	} else {
+		dir_debug("Ignoring host %s update vhost_count=%u "
+			  "down=%d last_updown_change=%ld (hosts_hash=%u)",
+			  net_ip2addr(&ip), vhost_count, down,
+			  (long)last_updown_change,
+			  mail_hosts_hash(conn->dir->mail_hosts));
 	}
 	return TRUE;
 }
@@ -1120,6 +1191,8 @@ static int
 director_connection_handle_handshake(struct director_connection *conn,
 				     const char *cmd, const char *const *args)
 {
+	unsigned int major_version;
+
 	/* both incoming and outgoing connections get VERSION and ME */
 	if (strcmp(cmd, "VERSION") == 0 && str_array_length(args) >= 3) {
 		if (strcmp(args[0], DIRECTOR_VERSION_NAME) != 0) {
@@ -1127,13 +1200,22 @@ director_connection_handle_handshake(struct director_connection *conn,
 				"(%s vs %s)",
 				conn->name, args[0], DIRECTOR_VERSION_NAME);
 			return -1;
-		} else if (atoi(args[1]) != DIRECTOR_VERSION_MAJOR) {
+		} else if (str_to_uint(args[1], &major_version) < 0 ||
+			str_to_uint(args[2], &conn->minor_version) < 0) {
+			i_error("director(%s): Invalid protocol version: "
+				"%s.%s", conn->name, args[1], args[2]);
+			return -1;
+		} else if (major_version != DIRECTOR_VERSION_MAJOR) {
 			i_error("director(%s): Incompatible protocol version: "
-				"%u vs %u", conn->name, atoi(args[1]),
+				"%u vs %u", conn->name, major_version,
 				DIRECTOR_VERSION_MAJOR);
 			return -1;
 		}
-		conn->minor_version = atoi(args[2]);
+		if (conn->minor_version < DIRECTOR_VERSION_TAGS_V2 &&
+		    mail_hosts_have_tags(conn->dir->mail_hosts)) {
+			i_error("director(%s): Director version supports incompatible tags", conn->name);
+			return FALSE;
+		}
 		conn->version_received = TRUE;
 		if (conn->done_pending) {
 			if (director_connection_send_done(conn) < 0)
@@ -1189,7 +1271,7 @@ static bool
 director_connection_sync_host(struct director_connection *conn,
 			      struct director_host *host,
 			      uint32_t seq, unsigned int minor_version,
-			      unsigned int timestamp)
+			      unsigned int timestamp, unsigned int hosts_hash)
 {
 	struct director *dir = conn->dir;
 
@@ -1207,6 +1289,16 @@ director_connection_sync_host(struct director_connection *conn,
 		   successfully connected to both directions */
 		i_assert(dir->left != NULL && dir->right != NULL);
 
+		if (hosts_hash != 0 &&
+		    hosts_hash != mail_hosts_hash(conn->dir->mail_hosts)) {
+			i_error("director(%s): Hosts unexpectedly changed during SYNC reply - resending"
+				"(seq=%u, old hosts_hash=%u, new hosts_hash=%u)",
+				conn->name, seq, hosts_hash,
+				mail_hosts_hash(dir->mail_hosts));
+			(void)director_resend_sync(dir);
+			return FALSE;
+		}
+
 		dir->ring_min_version = minor_version;
 		if (!dir->ring_handshaked) {
 			/* the ring is handshaked */
@@ -1215,8 +1307,9 @@ director_connection_sync_host(struct director_connection *conn,
 			/* duplicate SYNC (which was sent just in case the
 			   previous one got lost) */
 		} else {
-			dir_debug("Ring is synced (%s sent seq=%u)",
-				  conn->name, seq);
+			dir_debug("Ring is synced (%s sent seq=%u, hosts_hash=%u)",
+				  conn->name, seq,
+				  mail_hosts_hash(dir->mail_hosts));
 			director_set_ring_synced(dir);
 		}
 	} else {
@@ -1256,10 +1349,32 @@ director_connection_sync_host(struct director_connection *conn,
 			return FALSE;
 		}
 
+		if (hosts_hash != 0 &&
+		    hosts_hash != mail_hosts_hash(conn->dir->mail_hosts)) {
+			if (host->desynced_hosts_hash != hosts_hash) {
+				dir_debug("Ignore director %s stale SYNC request whose hosts don't match us "
+					  "(seq=%u, remote hosts_hash=%u, my hosts_hash=%u)",
+					  net_ip2addr(&host->ip), seq, hosts_hash,
+					  mail_hosts_hash(dir->mail_hosts));
+				host->desynced_hosts_hash = hosts_hash;
+				return FALSE;
+			}
+			/* we'll get here only if we received a SYNC twice
+			   with the same wrong hosts_hash. FIXME: this gets
+			   triggered unnecessarily sometimes if hosts are
+			   changing rapidly. */
+			i_error("director(%s): Director %s SYNC request hosts don't match us - resending hosts "
+				"(seq=%u, remote hosts_hash=%u, my hosts_hash=%u)",
+				conn->name, net_ip2addr(&host->ip), seq,
+				hosts_hash, mail_hosts_hash(dir->mail_hosts));
+			director_resend_hosts(dir);
+			return FALSE;
+		}
+		host->desynced_hosts_hash = 0;
 		if (dir->right != NULL) {
 			/* forward it to the connection on right */
 			director_sync_send(dir, host, seq, minor_version,
-					   timestamp);
+					   timestamp, hosts_hash);
 		}
 	}
 	return TRUE;
@@ -1271,20 +1386,28 @@ static bool director_connection_sync(struct director_connection *conn,
 	struct director *dir = conn->dir;
 	struct director_host *host;
 	struct ip_addr ip;
-	unsigned int port, seq, minor_version = 0, timestamp = ioloop_time;
+	in_port_t port;
+	unsigned int arg_count, seq, minor_version = 0, timestamp = ioloop_time;
+	unsigned int hosts_hash = 0;
 
-	if (str_array_length(args) < 3 ||
+	arg_count = str_array_length(args);
+	if (arg_count < 3 ||
 	    !director_args_parse_ip_port(conn, args, &ip, &port) ||
 	    str_to_uint(args[2], &seq) < 0) {
 		director_cmd_error(conn, "Invalid parameters");
 		return FALSE;
 	}
-	if (args[3] != NULL) {
-		minor_version = atoi(args[3]);
-		if (args[4] != NULL && str_to_uint(args[4], &timestamp) < 0) {
-			director_cmd_error(conn, "Invalid parameters");
-			return FALSE;
-		}
+	if (arg_count >= 4 && str_to_uint(args[3], &minor_version) < 0) {
+		director_cmd_error(conn, "Invalid parameters");
+		return FALSE;
+	}
+	if (arg_count >= 5 && str_to_uint(args[4], &timestamp) < 0) {
+		director_cmd_error(conn, "Invalid parameters");
+		return FALSE;
+	}
+	if (arg_count >= 6 && str_to_uint(args[5], &hosts_hash) < 0) {
+		director_cmd_error(conn, "Invalid parameters");
+		return FALSE;
 	}
 
 	/* find the originating director. if we don't see it, it was already
@@ -1292,7 +1415,8 @@ static bool director_connection_sync(struct director_connection *conn,
 	host = director_host_lookup(dir, &ip, port);
 	if (host != NULL) {
 		if (!director_connection_sync_host(conn, host, seq,
-						   minor_version, timestamp))
+						   minor_version, timestamp,
+						   hosts_hash))
 			return TRUE;
 	}
 
@@ -1308,7 +1432,7 @@ static bool director_cmd_connect(struct director_connection *conn,
 	struct director *dir = conn->dir;
 	struct director_host *host;
 	struct ip_addr ip;
-	unsigned int port;
+	in_port_t port;
 
 	if (str_array_length(args) != 2 ||
 	    !director_args_parse_ip_port(conn, args, &ip, &port)) {
@@ -1572,14 +1696,26 @@ static void
 director_connection_send_hosts(struct director_connection *conn, string_t *str)
 {
 	struct mail_host *const *hostp;
+	bool send_updowns;
+
+	send_updowns = conn->minor_version >= DIRECTOR_VERSION_UPDOWN;
 
 	str_printfa(str, "HOST-HAND-START\t%u\n", conn->dir->ring_handshaked);
 	array_foreach(mail_hosts_get(conn->dir->mail_hosts), hostp) {
+		struct mail_host *host = *hostp;
+		const char *host_tag = mail_host_get_tag(host);
+
 		str_printfa(str, "HOST\t%s\t%u",
-			    net_ip2addr(&(*hostp)->ip), (*hostp)->vhost_count);
-		if ((*hostp)->tag[0] != '\0') {
+			    net_ip2addr(&host->ip), host->vhost_count);
+		if (host_tag[0] != '\0' || send_updowns) {
 			str_append_c(str, '\t');
-			str_append_tabescaped(str, (*hostp)->tag);
+			str_append_tabescaped(str, host_tag);
+		}
+		if (send_updowns) {
+			str_printfa(str, "\t%c%ld\t", host->down ? 'D' : 'U',
+				    (long)host->last_updown_change);
+			if (host->hostname != NULL)
+				str_append_tabescaped(str, host->hostname);
 		}
 		str_append_c(str, '\n');
 	}
@@ -1693,9 +1829,10 @@ static void director_connection_send_handshake(struct director_connection *conn)
 {
 	director_connection_send(conn, t_strdup_printf(
 		"VERSION\t"DIRECTOR_VERSION_NAME"\t%u\t%u\n"
-		"ME\t%s\t%u\n",
+		"ME\t%s\t%u\t%lld\n",
 		DIRECTOR_VERSION_MAJOR, DIRECTOR_VERSION_MINOR,
-		net_ip2addr(&conn->dir->self_ip), conn->dir->self_port));
+		net_ip2addr(&conn->dir->self_ip), conn->dir->self_port,
+		(long long)time(NULL)));
 }
 
 struct director_connection *
@@ -1835,8 +1972,8 @@ void director_connection_deinit(struct director_connection **_conn,
 	}
 }
 
-void director_connection_disconnected(struct director_connection **_conn,
-				      const char *reason)
+static void director_connection_disconnected(struct director_connection **_conn,
+					     const char *reason)
 {
 	struct director_connection *conn = *_conn;
 	struct director *dir = conn->dir;

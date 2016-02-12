@@ -44,6 +44,15 @@ char *p_strdup(pool_t pool, const char *str)
 	return mem;
 }
 
+void *p_memdup(pool_t pool, const void *data, size_t size)
+{
+	void *mem;
+
+	mem = p_malloc(pool, size);
+	memcpy(mem, data, size);
+	return mem;
+}
+
 char *p_strdup_empty(pool_t pool, const char *str)
 {
 	if (str == NULL || *str == '\0')
@@ -353,6 +362,65 @@ const char *t_str_ucase(const char *str)
 	i_assert(str != NULL);
 
 	return str_ucase(t_strdup_noconst(str));
+}
+
+#if 0 /* FIXME: wait for v2.3 due to a collision with pigeonhole */
+const char *t_str_trim(const char *str, const char *chars)
+{
+	const char *p, *pend, *begin;
+
+	pend = str + strlen(str);
+	if (pend == str)
+		return "";
+
+	p = str;
+	while (p < pend && strchr(chars, *p) != NULL)
+		p++;
+	begin = p;
+
+	p = pend - 1;
+	while (p > begin && strchr(chars, *p) != NULL)
+		p--;
+
+	if (p <= begin)
+		return "";
+	return t_strdup_until(begin, p+1);
+}
+#endif
+
+const char *str_ltrim(const char *str, const char *chars)
+{
+	const char *p;
+
+	if (*str == '\0')
+		return "";
+
+	p = str;
+	while (*p != '\0' && strchr(chars, *p) != NULL)
+		p++;
+
+	return p;
+}
+
+const char *t_str_ltrim(const char *str, const char *chars)
+{
+	return t_strdup(str_ltrim(str, chars));
+}
+
+const char *t_str_rtrim(const char *str, const char *chars)
+{
+	const char *p, *pend;
+
+	pend = str + strlen(str);
+	if (pend == str)
+		return "";
+
+	p = pend - 1;
+	while (p > str && strchr(chars, *p) != NULL)
+		p--;
+	if (p <= str)
+		return "";
+	return t_strdup_until(str, p+1);
 }
 
 int null_strcmp(const char *s1, const char *s2)

@@ -9,7 +9,6 @@
 #include "mail-cache-private.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 
 struct mail_index_sync_ctx {
 	struct mail_index *index;
@@ -23,9 +22,9 @@ struct mail_index_sync_ctx {
 
 	ARRAY(struct mail_index_sync_list) sync_list;
 	uint32_t next_uid;
-	uint32_t last_tail_seq, last_tail_offset;
 
 	unsigned int no_warning:1;
+	unsigned int seen_nonexternal_transactions:1;
 };
 
 static void mail_index_sync_add_expunge(struct mail_index_sync_ctx *ctx)
@@ -164,19 +163,6 @@ static void mail_index_sync_add_dirty_updates(struct mail_index_sync_ctx *ctx)
 	}
 }
 
-static void
-mail_index_sync_update_mailbox_pos(struct mail_index_sync_ctx *ctx)
-{
-	uint32_t seq;
-	uoff_t offset;
-
-	mail_transaction_log_view_get_prev_pos(ctx->view->log_view,
-					       &seq, &offset);
-
-	ctx->last_tail_seq = seq;
-	ctx->last_tail_offset = offset + ctx->hdr->size + sizeof(*ctx->hdr);
-}
-
 static int
 mail_index_sync_read_and_sort(struct mail_index_sync_ctx *ctx)
 {
@@ -202,8 +188,14 @@ mail_index_sync_read_and_sort(struct mail_index_sync_ctx *ctx)
 			continue;
 
 		T_BEGIN {
-			if (mail_index_sync_add_transaction(ctx))
-				mail_index_sync_update_mailbox_pos(ctx);
+			if (mail_index_sync_add_transaction(ctx)) {
+				/* update tail_offset if needed */
+				ctx->seen_nonexternal_transactions = TRUE;
+			} else {
+				/* this is an internal change. we don't
+				   necessarily need to update tail_offset, so
+				   avoid the extra write caused by it. */
+			}
 		} T_END;
 	}
 
@@ -435,8 +427,6 @@ mail_index_sync_begin_to2(struct mail_index *index,
 
 	ctx = i_new(struct mail_index_sync_ctx, 1);
 	ctx->index = index;
-	ctx->last_tail_seq = hdr->log_file_seq;
-	ctx->last_tail_offset = hdr->log_file_tail_offset;
 	ctx->flags = flags;
 
 	ctx->view = mail_index_view_open(index);
@@ -524,7 +514,8 @@ bool mail_index_sync_has_expunges(struct mail_index_sync_ctx *ctx)
 }
 
 static bool mail_index_sync_view_have_any(struct mail_index_view *view,
-					  enum mail_index_sync_flags flags)
+					  enum mail_index_sync_flags flags,
+					  bool expunges_only)
 {
 	const struct mail_transaction_header *hdr;
 	const void *data;
@@ -558,19 +549,22 @@ static bool mail_index_sync_view_have_any(struct mail_index_view *view,
 			continue;
 
 		switch (hdr->type & MAIL_TRANSACTION_TYPE_MASK) {
+		case MAIL_TRANSACTION_EXPUNGE:
+		case MAIL_TRANSACTION_EXPUNGE_GUID:
+			return TRUE;
 		case MAIL_TRANSACTION_EXT_REC_UPDATE:
 		case MAIL_TRANSACTION_EXT_ATOMIC_INC:
 			/* extension record updates aren't exactly needed
 			   to be synced, but cache syncing relies on tail
 			   offsets being updated. */
-		case MAIL_TRANSACTION_EXPUNGE:
-		case MAIL_TRANSACTION_EXPUNGE_GUID:
 		case MAIL_TRANSACTION_FLAG_UPDATE:
 		case MAIL_TRANSACTION_KEYWORD_UPDATE:
 		case MAIL_TRANSACTION_KEYWORD_RESET:
 		case MAIL_TRANSACTION_INDEX_DELETED:
 		case MAIL_TRANSACTION_INDEX_UNDELETED:
-			return TRUE;
+			if (!expunges_only)
+				return TRUE;
+			break;
 		default:
 			break;
 		}
@@ -585,7 +579,18 @@ bool mail_index_sync_have_any(struct mail_index *index,
 	bool ret;
 
 	view = mail_index_view_open(index);
-	ret = mail_index_sync_view_have_any(view, flags);
+	ret = mail_index_sync_view_have_any(view, flags, FALSE);
+	mail_index_view_close(&view);
+	return ret;
+}
+
+bool mail_index_sync_have_any_expunges(struct mail_index *index)
+{
+	struct mail_index_view *view;
+	bool ret;
+
+	view = mail_index_view_open(index);
+	ret = mail_index_sync_view_have_any(view, 0, TRUE);
 	mail_index_view_close(&view);
 	return ret;
 }
@@ -748,6 +753,7 @@ static void mail_index_sync_end(struct mail_index_sync_ctx **_ctx)
 static void
 mail_index_sync_update_mailbox_offset(struct mail_index_sync_ctx *ctx)
 {
+	const struct mail_index_header *hdr = &ctx->index->map->hdr;
 	uint32_t seq;
 	uoff_t offset;
 
@@ -763,9 +769,15 @@ mail_index_sync_update_mailbox_offset(struct mail_index_sync_ctx *ctx)
 	mail_transaction_log_set_mailbox_sync_pos(ctx->index->log, seq, offset);
 
 	/* If tail offset has changed, make sure it gets written to
-	   transaction log. do this only if we're required to changes. */
-	if (ctx->last_tail_seq != seq ||
-	    ctx->last_tail_offset < offset) {
+	   transaction log. do this only if we're required to make changes.
+
+	   avoid writing a new tail offset if all the transactions were
+	   external, because that wouldn't change effective the tail offset.
+	   except e.g. mdbox map requires this to happen, so do it
+	   optionally. */
+	if ((hdr->log_file_seq != seq || hdr->log_file_tail_offset < offset) &&
+	    (ctx->seen_nonexternal_transactions ||
+	     (ctx->flags & MAIL_INDEX_SYNC_FLAG_UPDATE_TAIL_OFFSET) != 0)) {
 		ctx->ext_trans->log_updates = TRUE;
 		ctx->ext_trans->tail_offset_changed = TRUE;
 	}
@@ -775,9 +787,12 @@ static bool mail_index_sync_want_index_write(struct mail_index *index)
 {
 	uint32_t log_diff;
 
-	if (index->last_read_log_file_seq != index->map->hdr.log_file_seq) {
-		/* we recently just rotated the log and rewrote index */
-		return FALSE;
+	if (index->last_read_log_file_seq != 0 &&
+	    index->last_read_log_file_seq != index->map->hdr.log_file_seq) {
+		/* dovecot.index points to an old .log file. we were supposed
+		   to rewrite the dovecot.index when rotating the log, so
+		   we shouldn't usually get here. */
+		return TRUE;
 	}
 
 	log_diff = index->map->hdr.log_file_tail_offset -

@@ -61,6 +61,9 @@ struct mail_cache_field global_cache_fields[MAIL_INDEX_CACHE_FIELD_COUNT] = {
 	  .type = MAIL_CACHE_FIELD_VARIABLE_SIZE },
 	{ .name = "body.snippet",
 	  .type = MAIL_CACHE_FIELD_VARIABLE_SIZE }
+	/* FIXME: for now need to update get_metadata_precache_fields() in
+	   index-status.c when adding more fields. those fields should probably
+	   just be moved here to the same struct. */
 };
 
 static int index_mail_parse_body(struct index_mail *mail,
@@ -195,7 +198,7 @@ enum mail_flags index_mail_get_flags(struct mail *_mail)
 	flags = rec->flags & (MAIL_FLAGS_NONRECENT |
 			      MAIL_INDEX_MAIL_FLAG_BACKEND);
 
-	if (index_mailbox_is_recent(_mail->box, _mail->uid))
+	if (mailbox_recent_flags_have_uid(_mail->box, _mail->uid))
 		flags |= MAIL_RECENT;
 
 	if (index_mail_get_pvt(_mail)) {
@@ -1397,7 +1400,7 @@ int index_mail_get_special(struct mail *_mail,
 		return 0;
 	case MAIL_FETCH_BODY_SNIPPET:
 		return index_mail_fetch_body_snippet(mail, value_r);
-	case MAIL_FETCH_UIDL_FILE_NAME:
+	case MAIL_FETCH_STORAGE_ID:
 	case MAIL_FETCH_UIDL_BACKEND:
 	case MAIL_FETCH_SEARCH_RELEVANCY:
 	case MAIL_FETCH_GUID:
@@ -1980,7 +1983,7 @@ void index_mail_update_flags(struct mail *_mail, enum modify_type modify_type,
 	bool update_modseq = FALSE;
 
 	if ((flags & MAIL_RECENT) == 0 &&
-	    index_mailbox_is_recent(_mail->box, _mail->uid))
+	    mailbox_recent_flags_have_uid(_mail->box, _mail->uid))
 		index_mail_drop_recent_flag(_mail);
 	flags &= MAIL_FLAGS_NONRECENT | MAIL_INDEX_MAIL_FLAG_BACKEND;
 

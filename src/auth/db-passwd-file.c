@@ -13,9 +13,8 @@
 #include "hash.h"
 #include "str.h"
 #include "eacces-error.h"
-#include "var-expand.h"
+#include "ioloop.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -263,6 +262,10 @@ static int passwd_file_sync(struct auth_request *request,
 	struct stat st;
 	const char *error;
 
+	if (pw->last_sync_time == ioloop_time)
+		return 0;
+	pw->last_sync_time = ioloop_time;
+
 	if (stat(pw->path, &st) < 0) {
 		/* with variables don't give hard errors, or errors about
 		   nonexistent files */
@@ -431,15 +434,13 @@ db_passwd_file_lookup(struct db_passwd_file *db, struct auth_request *request,
 {
 	struct passwd_file *pw;
 	struct passwd_user *pu;
-	const struct var_expand_table *table;
 	string_t *username, *dest;
 
 	if (!db->vars)
 		pw = db->default_file;
 	else {
-		table = auth_request_get_var_expand_table(request, path_fix);
 		dest = t_str_new(256);
-		var_expand(dest, db->path, table);
+		auth_request_var_expand(dest, db->path, request, path_fix);
 
 		pw = hash_table_lookup(db->files, str_c(dest));
 		if (pw == NULL) {
@@ -454,9 +455,8 @@ db_passwd_file_lookup(struct db_passwd_file *db, struct auth_request *request,
 	}
 
 	username = t_str_new(256);
-	table = auth_request_get_var_expand_table(request,
-						  auth_request_str_escape);
-	var_expand(username, username_format, table);
+	auth_request_var_expand(username, username_format, request,
+				auth_request_str_escape);
 
 	auth_request_log_debug(request, AUTH_SUBSYS_DB,
 			       "lookup: user=%s file=%s",

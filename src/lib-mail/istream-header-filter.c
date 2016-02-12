@@ -6,7 +6,6 @@
 #include "istream-private.h"
 #include "istream-header-filter.h"
 
-#include <stdlib.h>
 
 struct header_filter_istream {
 	struct istream_private istream;
@@ -221,7 +220,8 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 					  mstream->context);
 			if (matched != orig_matched &&
 			    !mstream->headers_edited) {
-				i_array_init(&mstream->match_change_lines, 8);
+				if (!array_is_created(&mstream->match_change_lines))
+					i_array_init(&mstream->match_change_lines, 8);
 				array_append(&mstream->match_change_lines,
 					     &mstream->cur_line, 1);
 			}
@@ -505,8 +505,10 @@ i_stream_header_filter_stat(struct istream_private *stream, bool exact)
 	const struct stat *st;
 	uoff_t old_offset;
 
-	if (i_stream_stat(stream->parent, exact, &st) < 0)
+	if (i_stream_stat(stream->parent, exact, &st) < 0) {
+		stream->istream.stream_errno = stream->parent->stream_errno;
 		return -1;
+	}
 	stream->statbuf = *st;
 	if (stream->statbuf.st_size == -1 || !exact)
 		return 0;

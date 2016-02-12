@@ -794,9 +794,7 @@ mail_transaction_log_file_create2(struct mail_transaction_log_file *file,
 		   file_dotlock_replace(). during that time the log file
 		   doesn't exist, which could cause problems. */
 		path2 = t_strconcat(file->filepath, ".2", NULL);
-		if (unlink(path2) < 0 && errno != ENOENT) {
-                        mail_index_set_error(index, "unlink(%s) failed: %m",
-					     path2);
+		if (i_unlink_if_exists(path2) < 0) {
 			/* try to link() anyway */
 		}
 		if (nfs_safe_link(file->filepath, path2, FALSE) < 0 &&
@@ -916,11 +914,8 @@ int mail_transaction_log_file_open(struct mail_transaction_log_file *file)
 			/* corrupted */
 			if (index->readonly) {
 				/* don't delete */
-			} else if (unlink(file->filepath) < 0 &&
-				   errno != ENOENT) {
-				mail_index_set_error(index,
-						     "unlink(%s) failed: %m",
-						     file->filepath);
+			} else {
+				i_unlink_if_exists(file->filepath);
 			}
 			return 0;
 		}
@@ -1686,6 +1681,7 @@ int mail_transaction_log_file_map(struct mail_transaction_log_file *file,
 				  uoff_t start_offset, uoff_t end_offset)
 {
 	struct mail_index *index = file->log->index;
+	uoff_t map_start_offset = start_offset;
 	size_t size;
 	int ret;
 
@@ -1741,14 +1737,14 @@ int mail_transaction_log_file_map(struct mail_transaction_log_file *file,
 		/* although we could just skip over the unwanted data, we have
 		   to sync everything so that modseqs are calculated
 		   correctly */
-		start_offset = file->sync_offset;
+		map_start_offset = file->sync_offset;
 	}
 
 	if ((file->log->index->flags & MAIL_INDEX_OPEN_FLAG_MMAP_DISABLE) == 0)
-		ret = mail_transaction_log_file_map_mmap(file, start_offset);
+		ret = mail_transaction_log_file_map_mmap(file, map_start_offset);
 	else {
 		mail_transaction_log_file_munmap(file);
-		ret = mail_transaction_log_file_read(file, start_offset, FALSE);
+		ret = mail_transaction_log_file_read(file, map_start_offset, FALSE);
 	}
 
 	i_assert(file->buffer == NULL || file->mmap_base != NULL ||

@@ -3,6 +3,7 @@
 #include "lib.h"
 #include "ioloop.h"
 #include "net.h"
+#include "str.h"
 #include "istream.h"
 #include "ostream.h"
 #include "llist.h"
@@ -39,8 +40,8 @@ struct login_host_request {
 	char *line, *username;
 
 	struct ip_addr local_ip;
-	unsigned int local_port;
-	unsigned int dest_port;
+	in_port_t local_port;
+	in_port_t dest_port;
 	bool director_proxy_maybe;
 };
 
@@ -124,8 +125,8 @@ static bool login_host_request_is_self(struct login_host_request *request,
 }
 
 static void
-login_host_callback(const struct ip_addr *ip, const char *errormsg,
-		    void *context)
+login_host_callback(const struct ip_addr *ip, const char *hostname,
+		    const char *errormsg, void *context)
 {
 	struct login_host_request *request = context;
 	struct director *dir = request->conn->dir;
@@ -148,9 +149,17 @@ login_host_callback(const struct ip_addr *ip, const char *errormsg,
 		   login_host_request_is_self(request, ip)) {
 		line = request->line;
 	} else {
+		string_t *str = t_str_new(64);
+
 		secs = dir->set->director_user_expire / 2;
-		line = t_strdup_printf("%s\thost=%s\tproxy_refresh=%u",
-				       request->line, net_ip2addr(ip), secs);
+		str_printfa(str, "%s\tproxy_refresh=%u\t", request->line, secs);
+		if (hostname == NULL || hostname[0] == '\0')
+			str_printfa(str, "host=%s", net_ip2addr(ip));
+		else {
+			str_printfa(str, "host=%s\thostip=%s",
+				    hostname, net_ip2addr(ip));
+		}
+		line = str_c(str);
 	}
 	login_connection_send_line(request->conn, line);
 
@@ -202,10 +211,10 @@ static void auth_input_line(const char *line, void *context)
 			if (net_addr2ip((*args) + 4, &temp_request.local_ip) < 0)
 				i_error("auth sent invalid lip field: %s", (*args) + 6);
 		} else if (strncmp(*args, "lport=", 6) == 0) {
-			if (str_to_uint((*args) + 6, &temp_request.local_port) < 0)
+			if (net_str2port((*args) + 6, &temp_request.local_port) < 0)
 				i_error("auth sent invalid lport field: %s", (*args) + 6);
 		} else if (strncmp(*args, "port=", 5) == 0) {
-			if (str_to_uint((*args) + 5, &temp_request.dest_port) < 0)
+			if (net_str2port((*args) + 5, &temp_request.dest_port) < 0)
 				i_error("auth sent invalid port field: %s", (*args) + 6);
 		} else if (strncmp(*args, "destuser=", 9) == 0)
 			username = *args + 9;

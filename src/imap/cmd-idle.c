@@ -1,8 +1,6 @@
 /* Copyright (c) 2002-2015 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
-#include "net.h"
-#include "ioloop.h"
 #include "istream.h"
 #include "ostream.h"
 #include "crc32.h"
@@ -11,14 +9,12 @@
 #include "imap-keepalive.h"
 #include "imap-sync.h"
 
-#include <stdlib.h>
-
 struct cmd_idle_context {
 	struct client *client;
 	struct client_command_context *cmd;
 
 	struct imap_sync_context *sync_ctx;
-	struct timeout *keepalive_to;
+	struct timeout *keepalive_to, *to_hibernate;
 
 	unsigned int manual_cork:1;
 	unsigned int sync_pending:1;
@@ -34,6 +30,8 @@ idle_finish(struct cmd_idle_context *ctx, bool done_ok, bool free_cmd)
 
 	if (ctx->keepalive_to != NULL)
 		timeout_remove(&ctx->keepalive_to);
+	if (ctx->to_hibernate != NULL)
+		timeout_remove(&ctx->to_hibernate);
 
 	if (ctx->sync_ctx != NULL) {
 		/* we're here only in connection failure cases */
@@ -74,7 +72,7 @@ idle_client_handle_input(struct cmd_idle_context *ctx, bool free_cmd)
 	return FALSE;
 }
 
-static void idle_client_input_more(struct cmd_idle_context *ctx)
+static bool idle_client_input_more(struct cmd_idle_context *ctx)
 {
 	struct client *client = ctx->client;
 
@@ -84,35 +82,34 @@ static void idle_client_input_more(struct cmd_idle_context *ctx)
 	switch (i_stream_read(client->input)) {
 	case -1:
 		/* disconnected */
-		client_disconnect(client, "Disconnected in IDLE");
-		return;
+		client_disconnect(client, NULL);
+		return TRUE;
 	case -2:
 		client->input_skip_line = TRUE;
 		idle_finish(ctx, FALSE, TRUE);
-		client_continue_pending_input(client);
-		return;
+		return TRUE;
 	}
 
 	if (ctx->sync_ctx != NULL) {
 		/* we're still sending output to client. wait until it's all
 		   sent so we don't lose any changes. */
 		io_remove(&client->io);
-		return;
+		return FALSE;
 	}
 
-	if (idle_client_handle_input(ctx, TRUE)) {
-		if (!client->disconnected)
-			client_continue_pending_input(client);
-	}
+	return idle_client_handle_input(ctx, TRUE);
 }
 
 static void idle_client_input(struct cmd_idle_context *ctx)
 {
 	struct client *client = ctx->client;
 
-	idle_client_input_more(ctx);
-	if (client->disconnected)
-		client_destroy(client, NULL);
+	if (idle_client_input_more(ctx)) {
+		if (client->disconnected)
+			client_destroy(client, NULL);
+		else
+			client_continue_pending_input(client);
+	}
 }
 
 static void keepalive_timeout(struct cmd_idle_context *ctx)
@@ -178,6 +175,34 @@ static void idle_add_keepalive_timeout(struct cmd_idle_context *ctx)
 	ctx->keepalive_to = timeout_add(interval, keepalive_timeout, ctx);
 }
 
+static void idle_hibernate_timeout(struct cmd_idle_context *ctx)
+{
+	struct client *client = ctx->client;
+
+	i_assert(ctx->sync_ctx == NULL);
+	i_assert(!ctx->sync_pending);
+
+	if (imap_client_hibernate(&client)) {
+		/* client may be destroyed now */
+	} else {
+		/* failed - don't bother retrying */
+		timeout_remove(&ctx->to_hibernate);
+	}
+}
+
+static void idle_add_hibernate_timeout(struct cmd_idle_context *ctx)
+{
+	unsigned int secs = ctx->client->set->imap_hibernate_timeout;
+
+	i_assert(ctx->to_hibernate == NULL);
+
+	if (secs == 0)
+		return;
+
+	ctx->to_hibernate =
+		timeout_add(secs * 1000, idle_hibernate_timeout, ctx);
+}
+
 static bool cmd_idle_continue(struct client_command_context *cmd)
 {
 	struct client *client = cmd->client;
@@ -188,6 +213,9 @@ static bool cmd_idle_continue(struct client_command_context *cmd)
 		idle_finish(ctx, FALSE, FALSE);
 		return TRUE;
 	}
+
+	if (ctx->to_hibernate != NULL)
+		timeout_reset(ctx->to_hibernate);
 
 	if (ctx->manual_cork)  {
 		/* we're coming from idle_callback instead of a normal
@@ -225,6 +253,8 @@ static bool cmd_idle_continue(struct client_command_context *cmd)
 		   so we return here instead of doing everything twice. */
 		return FALSE;
 	}
+	if (ctx->to_hibernate == NULL)
+		idle_add_hibernate_timeout(ctx);
 	cmd->state = CLIENT_COMMAND_STATE_WAIT_INPUT;
 
 	if (ctx->manual_cork) {
@@ -240,7 +270,7 @@ static bool cmd_idle_continue(struct client_command_context *cmd)
 		/* input is pending */
 		client->io = io_add_istream(client->input,
 					    idle_client_input, ctx);
-		idle_client_input_more(ctx);
+		(void)idle_client_input_more(ctx);
 	}
 	return FALSE;
 }
@@ -254,10 +284,16 @@ bool cmd_idle(struct client_command_context *cmd)
 	ctx->cmd = cmd;
 	ctx->client = client;
 	idle_add_keepalive_timeout(ctx);
+	idle_add_hibernate_timeout(ctx);
 
 	if (client->mailbox != NULL)
 		mailbox_notify_changes(client->mailbox, idle_callback, ctx);
-	client_send_line(client, "+ idling");
+	if (!client->state_import_idle_continue)
+		client_send_line(client, "+ idling");
+	else {
+		/* continuing an IDLE after hibernation */
+		client->state_import_idle_continue = FALSE;
+	}
 
 	io_remove(&client->io);
 	client->io = io_add_istream(client->input, idle_client_input, ctx);

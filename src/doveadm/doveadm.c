@@ -16,7 +16,6 @@
 #include "doveadm-dsync.h"
 #include "doveadm.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 const struct doveadm_print_vfuncs *doveadm_print_vfuncs_all[] = {
@@ -329,12 +328,7 @@ int main(int argc, char *argv[])
 
 	argc -= optind;
 	argv += optind;
-#ifdef __GLIBC__
-	/* for subcommands allow -options anywhere in command line */
-	optind = 0;
-#else
-	optind = 1;
-#endif
+	i_getopt_reset();
 
 	master_service_init_finish(master_service);
 	if (!doveadm_debug) {

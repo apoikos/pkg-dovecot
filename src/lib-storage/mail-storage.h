@@ -90,10 +90,13 @@ enum mailbox_metadata_items {
 	MAILBOX_METADATA_VIRTUAL_SIZE		= 0x02,
 	MAILBOX_METADATA_CACHE_FIELDS		= 0x04,
 	MAILBOX_METADATA_PRECACHE_FIELDS	= 0x08,
-	MAILBOX_METADATA_BACKEND_NAMESPACE	= 0x10
+	MAILBOX_METADATA_BACKEND_NAMESPACE	= 0x10,
+	MAILBOX_METADATA_PHYSICAL_SIZE		= 0x20,
+	MAILBOX_METADATA_FIRST_SAVE_DATE	= 0x40
 	/* metadata items that require mailbox to be synced at least once. */
 #define MAILBOX_METADATA_SYNC_ITEMS \
-	(MAILBOX_METADATA_VIRTUAL_SIZE)
+	(MAILBOX_METADATA_VIRTUAL_SIZE | MAILBOX_METADATA_PHYSICAL_SIZE | \
+	 MAILBOX_METADATA_FIRST_SAVE_DATE)
 };
 
 enum mailbox_search_result_flags {
@@ -149,7 +152,8 @@ enum mail_fetch_field {
 	MAIL_FETCH_IMAP_ENVELOPE	= 0x00004000,
 	MAIL_FETCH_FROM_ENVELOPE	= 0x00008000,
 	MAIL_FETCH_HEADER_MD5		= 0x00010000,
-	MAIL_FETCH_UIDL_FILE_NAME	= 0x00020000,
+	MAIL_FETCH_STORAGE_ID		= 0x00020000,
+#define MAIL_FETCH_UIDL_FILE_NAME MAIL_FETCH_STORAGE_ID /* FIXME: remove in v2.3 */
 	MAIL_FETCH_UIDL_BACKEND		= 0x00040000,
 	MAIL_FETCH_MAILBOX_NAME		= 0x00080000,
 	MAIL_FETCH_SEARCH_RELEVANCY	= 0x00100000,
@@ -175,7 +179,11 @@ enum mailbox_transaction_flags {
 	MAILBOX_TRANSACTION_FLAG_NO_CACHE_DEC	= 0x10,
 	/* Sync transaction describes changes to mailbox that already happened
 	   to another mailbox with whom we're syncing with (dsync) */
-	MAILBOX_TRANSACTION_FLAG_SYNC		= 0x20
+	MAILBOX_TRANSACTION_FLAG_SYNC		= 0x20,
+	/* Don't trigger any notifications for this transaction. This
+	   especially means the notify plugin. This would normally be used only
+	   with _FLAG_SYNC. */
+	MAILBOX_TRANSACTION_FLAG_NO_NOTIFY	= 0x40
 };
 
 enum mailbox_sync_flags {
@@ -267,10 +275,17 @@ struct mailbox_metadata {
 	guid_128_t guid;
 	/* sum of virtual size of all messages in mailbox */
 	uint64_t virtual_size;
+	/* sum of physical size of all messages in mailbox */
+	uint64_t physical_size;
+	/* timestamp of when the first message was saved.
+	   (time_t)-1 if there are no mails in the mailbox. */
+	time_t first_save_date;
+
 	/* Fields that have "temp" or "yes" caching decision. */
 	const ARRAY_TYPE(mailbox_cache_field) *cache_fields;
 	/* Fields that should be precached */
 	enum mail_fetch_field precache_fields;
+
 	/* imapc backend returns this based on the remote NAMESPACE reply,
 	   while currently other backends return "" and type the same as the
 	   mailbox's real namespace type */

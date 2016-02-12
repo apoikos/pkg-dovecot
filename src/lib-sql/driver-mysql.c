@@ -3,11 +3,12 @@
 #include "lib.h"
 #include "ioloop.h"
 #include "array.h"
+#include "hex-binary.h"
 #include "str.h"
+#include "net.h"
 #include "sql-api-private.h"
 
 #ifdef BUILD_MYSQL
-#include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
 #ifdef HAVE_ATTR_NULL
@@ -22,6 +23,9 @@
 #endif
 #include <errmsg.h>
 
+#define MYSQL_DEFAULT_READ_TIMEOUT_SECS 30
+#define MYSQL_DEFAULT_WRITE_TIMEOUT_SECS 30
+
 struct mysql_db {
 	struct sql_db api;
 
@@ -30,7 +34,9 @@ struct mysql_db {
 	const char *ssl_cert, *ssl_key, *ssl_ca, *ssl_ca_path, *ssl_cipher;
 	int ssl_verify_server_cert;
 	const char *option_file, *option_group;
-	unsigned int port, client_flags;
+	in_port_t port;
+	unsigned int client_flags;
+	unsigned int connect_timeout, read_timeout, write_timeout;
 	time_t last_success;
 
 	MYSQL *mysql;
@@ -75,6 +81,7 @@ static int driver_mysql_connect(struct sql_db *_db)
 	const char *unix_socket, *host;
 	unsigned long client_flags = db->client_flags;
 	unsigned int secs_used;
+	time_t start_time;
 	bool failed;
 
 	i_assert(db->api.state == SQL_DB_STATE_DISCONNECTED);
@@ -94,6 +101,9 @@ static int driver_mysql_connect(struct sql_db *_db)
 			      db->option_file);
 	}
 
+	mysql_options(db->mysql, MYSQL_OPT_CONNECT_TIMEOUT, &db->connect_timeout);
+	mysql_options(db->mysql, MYSQL_OPT_READ_TIMEOUT, &db->read_timeout);
+	mysql_options(db->mysql, MYSQL_OPT_WRITE_TIMEOUT, &db->write_timeout);
 	mysql_options(db->mysql, MYSQL_READ_DEFAULT_GROUP,
 		      db->option_group != NULL ? db->option_group : "client");
 
@@ -116,15 +126,15 @@ static int driver_mysql_connect(struct sql_db *_db)
 #endif
 	}
 
-	alarm(SQL_CONNECT_TIMEOUT_SECS);
 #ifdef CLIENT_MULTI_RESULTS
 	client_flags |= CLIENT_MULTI_RESULTS;
 #endif
 	/* CLIENT_MULTI_RESULTS allows the use of stored procedures */
+	start_time = time(NULL);
 	failed = mysql_real_connect(db->mysql, host, db->user, db->password,
 				    db->dbname, db->port, unix_socket,
 				    client_flags) == NULL;
-	secs_used = SQL_CONNECT_TIMEOUT_SECS - alarm(0);
+	secs_used = time(NULL) - start_time;
 	if (failed) {
 		/* connecting could have taken a while. make sure that any
 		   timeouts that get added soon will get a refreshed
@@ -158,6 +168,9 @@ static void driver_mysql_parse_connect_string(struct mysql_db *db,
 
 	db->ssl_cipher = "HIGH";
 	db->ssl_verify_server_cert = 0; /* FIXME: change to 1 for v2.3 */
+	db->connect_timeout = SQL_CONNECT_TIMEOUT_SECS;
+	db->read_timeout = MYSQL_DEFAULT_READ_TIMEOUT_SECS;
+	db->write_timeout = MYSQL_DEFAULT_WRITE_TIMEOUT_SECS;
 
 	args = t_strsplit_spaces(connect_string, " ");
 	for (; *args != NULL; args++) {
@@ -179,11 +192,22 @@ static void driver_mysql_parse_connect_string(struct mysql_db *db,
 			field = &db->password;
 		else if (strcmp(name, "dbname") == 0)
 			field = &db->dbname;
-		else if (strcmp(name, "port") == 0)
-			db->port = atoi(value);
-		else if (strcmp(name, "client_flags") == 0)
-			db->client_flags = atoi(value);
-		else if (strcmp(name, "ssl_cert") == 0)
+		else if (strcmp(name, "port") == 0) {
+			if (net_str2port(value, &db->port) < 0)
+				i_fatal("mysql: Invalid port number: %s", value);
+		} else if (strcmp(name, "client_flags") == 0) {
+			if (str_to_uint(value, &db->client_flags) < 0)
+				i_fatal("mysql: Invalid client flags: %s", value);
+		} else if (strcmp(name, "connect_timeout") == 0) {
+			if (str_to_uint(value, &db->connect_timeout) < 0)
+				i_fatal("mysql: Invalid read_timeout: %s", value);
+		} else if (strcmp(name, "read_timeout") == 0) {
+			if (str_to_uint(value, &db->read_timeout) < 0)
+				i_fatal("mysql: Invalid read_timeout: %s", value);
+		} else if (strcmp(name, "write_timeout") == 0) {
+			if (str_to_uint(value, &db->write_timeout) < 0)
+				i_fatal("mysql: Invalid read_timeout: %s", value);
+		} else if (strcmp(name, "ssl_cert") == 0)
 			field = &db->ssl_cert;
 		else if (strcmp(name, "ssl_key") == 0)
 			field = &db->ssl_key;
@@ -615,6 +639,18 @@ driver_mysql_update(struct sql_transaction_context *_ctx, const char *query,
 				  query, affected_rows);
 }
 
+static const char *
+driver_mysql_escape_blob(struct sql_db *_db ATTR_UNUSED,
+			 const unsigned char *data, size_t size)
+{
+	string_t *str = t_str_new(128);
+
+	str_append(str, "HEX('");
+	binary_to_hex_append(str, data, size);
+	str_append_c(str, ')');
+	return str_c(str);
+}
+
 const struct sql_db driver_mysql_db = {
 	.name = "mysql",
 	.flags = SQL_DB_FLAG_BLOCKING | SQL_DB_FLAG_POOLED,
@@ -634,7 +670,9 @@ const struct sql_db driver_mysql_db = {
 		driver_mysql_transaction_commit_s,
 		driver_mysql_transaction_rollback,
 
-		driver_mysql_update
+		driver_mysql_update,
+
+		driver_mysql_escape_blob
 	}
 };
 

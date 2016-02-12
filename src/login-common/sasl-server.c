@@ -18,7 +18,6 @@
 #include "master-auth.h"
 #include "client-common.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #define ERR_TOO_MANY_USERIP_CONNECTIONS \
@@ -122,6 +121,7 @@ master_auth_callback(const struct master_auth_reply *reply, void *context)
 static void master_send_request(struct anvil_request *anvil_request)
 {
 	struct client *client = anvil_request->client;
+	struct master_auth_request_params params;
 	struct master_auth_request req;
 	const unsigned char *data;
 	size_t size;
@@ -152,8 +152,14 @@ static void master_send_request(struct anvil_request *anvil_request)
 
 	client->auth_finished = ioloop_time;
 	client->master_auth_id = req.auth_id;
-	master_auth_request(master_auth, client->fd, &req, buf->data,
-			    master_auth_callback, client, &client->master_tag);
+
+	memset(&params, 0, sizeof(params));
+	params.client_fd = client->fd;
+	params.socket_path = client->postlogin_socket_path;
+	params.request = req;
+	params.data = buf->data;
+	master_auth_request_full(master_auth, &params, master_auth_callback,
+				 client, &client->master_tag);
 }
 
 static void ATTR_NULL(1)
@@ -163,9 +169,15 @@ anvil_lookup_callback(const char *reply, void *context)
 	struct client *client = req->client;
 	const struct login_settings *set = client->set;
 	const char *errmsg;
+	unsigned int conn_count;
 
-	if (reply == NULL ||
-	    strtoul(reply, NULL, 10) < set->mail_max_userip_connections)
+	conn_count = 0;
+	if (reply != NULL && str_to_uint(reply, &conn_count) < 0)
+		i_fatal("Received invalid reply from anvil: %s", reply);
+
+	/* reply=NULL if we didn't need to do anvil lookup,
+	   or if the anvil lookup failed. allow failed anvil lookups in. */
+	if (reply == NULL || conn_count < set->mail_max_userip_connections)
 		master_send_request(req);
 	else {
 		client->authenticating = FALSE;
@@ -234,6 +246,8 @@ authenticate_callback(struct auth_client_request *request,
 	case AUTH_REQUEST_STATUS_OK:
 		client->auth_request = NULL;
 		client->auth_successes++;
+		client->auth_passdb_args = p_strarray_dup(client->pool, args);
+		client->postlogin_socket_path = NULL;
 
 		nologin = FALSE;
 		for (i = 0; args[i] != NULL; i++) {
@@ -249,6 +263,9 @@ authenticate_callback(struct auth_client_request *request,
 				i_free(client->virtual_auth_user);
 				client->virtual_auth_user =
 					i_strdup(args[i] + 10);
+			} else if (strncmp(args[i], "postlogin_socket=", 17) == 0) {
+				client->postlogin_socket_path =
+					p_strdup(client->pool, args[i] + 17);
 			} else if (strcmp(args[i], "nologin") == 0 ||
 				   strcmp(args[i], "proxy") == 0) {
 				/* user can't login */

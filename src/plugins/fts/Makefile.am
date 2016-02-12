@@ -7,6 +7,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-fts \
 	-I$(top_srcdir)/src/lib-http \
 	-I$(top_srcdir)/src/lib-mail \
+	-I$(top_srcdir)/src/lib-imap \
 	-I$(top_srcdir)/src/lib-index \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-storage/index \
@@ -44,6 +45,7 @@ pkginc_lib_HEADERS = \
 	fts-expunge-log.h \
 	fts-indexer.h \
 	fts-parser.h \
+	fts-storage.h \
 	fts-user.h
 
 noinst_HEADERS = \
@@ -51,8 +53,7 @@ noinst_HEADERS = \
 	fts-build-mail.h \
 	fts-plugin.h \
 	fts-search-args.h \
-	fts-search-serialize.h \
-	fts-storage.h
+	fts-search-serialize.h
 
 pkglibexec_PROGRAMS = xml2text
 

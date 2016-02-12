@@ -103,22 +103,19 @@ session_stats_need_send(struct stats_user *suser, time_t now,
 	}
 	*changed_r = FALSE;
 
+	diff = now - suser->last_session_update;
+	if (diff >= SESSION_STATS_FORCE_REFRESH_SECS)
+		return TRUE;
+	*to_next_secs_r = SESSION_STATS_FORCE_REFRESH_SECS - diff;
+
 	if (!suser->session_sent_duplicate) {
 		if (suser->last_session_update != now) {
 			/* send one duplicate notification so stats reader
 			   knows that this session is idle now */
 			return TRUE;
 		}
-		*to_next_secs_r = 1;
-		return FALSE;
 	}
-
-	diff = now - suser->last_session_update;
-	if (diff < SESSION_STATS_FORCE_REFRESH_SECS) {
-		*to_next_secs_r = SESSION_STATS_FORCE_REFRESH_SECS - diff;
-		return FALSE;
-	}
-	return TRUE;
+	return FALSE;
 }
 
 static void session_stats_refresh(struct mail_user *user)
@@ -425,6 +422,7 @@ static void stats_user_created(struct mail_user *user)
 			p_strdup(user->pool, guid_128_to_string(guid));
 	}
 	suser->last_session_update = time(NULL);
+	user->stats_enabled = TRUE;
 
 	suser->ioloop_ctx = ioloop_ctx;
 	io_loop_context_add_callbacks(ioloop_ctx,
@@ -440,6 +438,11 @@ static void stats_user_created(struct mail_user *user)
 	suser->to_stats_timeout =
 		timeout_add(suser->refresh_secs*1000,
 			    session_stats_refresh_timeout, user);
+	/* fill the initial values. this is necessary for the process-global
+	   values (e.g. getrusage()) if the process is reused for multiple
+	   users. otherwise the next user will start with the previous one's
+	   last values. */
+	mail_user_stats_fill(user, suser->pre_io_stats);
 }
 
 static struct mail_storage_hooks stats_mail_storage_hooks = {

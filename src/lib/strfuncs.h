@@ -10,6 +10,7 @@ int i_snprintf(char *dest, size_t max_chars, const char *format, ...)
 	ATTR_FORMAT(3, 4);
 
 char *p_strdup(pool_t pool, const char *str) ATTR_MALLOC;
+void *p_memdup(pool_t pool, const void *data, size_t size) ATTR_MALLOC;
 /* return NULL if str = "" */
 char *p_strdup_empty(pool_t pool, const char *str) ATTR_MALLOC;
 /* *end isn't included */
@@ -52,6 +53,12 @@ char *str_lcase(char *str);
 const char *t_str_lcase(const char *str);
 const char *t_str_ucase(const char *str);
 
+/* Trim matching chars from either side of the string */
+const char *str_ltrim(const char *str, const char *chars);
+const char *t_str_ltrim(const char *str, const char *chars);
+const char *t_str_rtrim(const char *str, const char *chars);
+/*const char *t_str_trim(const char *str, const char *chars);*/
+
 int null_strcmp(const char *s1, const char *s2) ATTR_PURE;
 int bsearch_strcmp(const char *key, const char *const *member) ATTR_PURE;
 int bsearch_strcasecmp(const char *key, const char *const *member) ATTR_PURE;
@@ -93,11 +100,9 @@ bool str_array_icase_find(const char *const *arr, const char *value);
 const char **p_strarray_dup(pool_t pool, const char *const *arr)
 	ATTR_MALLOC ATTR_RETURNS_NONNULL;
 
-#define i_qsort(base, nmemb, size, cmp) \
-	qsort(base, nmemb, size + \
-		CALLBACK_TYPECHECK(cmp, int (*)(typeof(const typeof(*base) *), \
-						typeof(const typeof(*base) *))), \
-		(int (*)(const void *, const void *))cmp)
+/* FIXME: v2.3 - sort and search APIs belong into their own header, not here */
+#include "sort.h"
+
 #define i_bsearch(key, base, nmemb, size, cmp) \
 	bsearch(key, base, nmemb, size + \
 		CALLBACK_TYPECHECK(cmp, int (*)(typeof(const typeof(*key) *), \

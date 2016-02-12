@@ -201,9 +201,9 @@ master_connection_input_line(struct master_connection *conn, const char *line)
 	unsigned int max_recent_msgs;
 	int ret;
 
-	/* <username> <mailbox> <max_recent_msgs> [i][o] */
-	if (str_array_length(args) != 4 ||
-	    str_to_uint(args[2], &max_recent_msgs) < 0 || args[3][0] == '\0') {
+	/* <username> <mailbox> <session ID> <max_recent_msgs> [i][o] */
+	if (str_array_length(args) != 5 ||
+	    str_to_uint(args[3], &max_recent_msgs) < 0 || args[4][0] == '\0') {
 		i_error("Invalid input from master: %s", line);
 		return -1;
 	}
@@ -212,6 +212,12 @@ master_connection_input_line(struct master_connection *conn, const char *line)
 	input.module = "mail";
 	input.service = "indexer-worker";
 	input.username = args[0];
+	/* if session-id is given, use it as a prefix to a unique session ID.
+	   we can't use the session-id directly or stats process will complain
+	   about duplicates. (especially LMTP would use the same session-id for
+	   multiple users' indexing at the same time.) */
+	if (args[2][0] != '\0')
+		input.session_id_prefix = args[2];
 
 	if (mail_storage_service_lookup_next(conn->storage_service, &input,
 					     &service_user, &user, &error) <= 0) {
@@ -220,7 +226,7 @@ master_connection_input_line(struct master_connection *conn, const char *line)
 	} else {
 		indexer_worker_refresh_proctitle(user->username, args[1], 0, 0);
 		ret = index_mailbox(conn, user, args[1],
-				    max_recent_msgs, args[3]);
+				    max_recent_msgs, args[4]);
 		indexer_worker_refresh_proctitle(NULL, NULL, 0, 0);
 		mail_user_unref(&user);
 		mail_storage_service_user_free(&service_user);

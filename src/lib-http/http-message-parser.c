@@ -3,6 +3,8 @@
 #include "lib.h"
 #include "array.h"
 #include "istream.h"
+#include "iostream.h"
+#include "istream-sized.h"
 #include "http-parser.h"
 #include "http-header.h"
 #include "http-header-parser.h"
@@ -18,6 +20,7 @@ void http_message_parser_init(struct http_message_parser *parser,
 {
 	memset(parser, 0, sizeof(*parser));
 	parser->input = input;
+	i_stream_ref(parser->input);
 	if (hdr_limits != NULL)
 		parser->header_limits = *hdr_limits;
 	parser->max_payload_size = max_payload_size;
@@ -32,6 +35,8 @@ void http_message_parser_deinit(struct http_message_parser *parser)
 		pool_unref(&parser->msg.pool);
 	if (parser->payload != NULL)
 		i_stream_unref(&parser->payload);
+	if (parser->input != NULL)
+		i_stream_unref(&parser->input);
 }
 
 void http_message_parser_restart(struct http_message_parser *parser,
@@ -383,8 +388,22 @@ int http_message_parse_headers(struct http_message_parser *parser)
 	return ret;
 }
 
+static const char *
+http_istream_error_callback(const struct istream_sized_error_data *data,
+			    struct istream *input)
+{
+	i_assert(data->eof);
+	i_assert(data->v_offset + data->new_bytes < data->wanted_size);
+
+	return t_strdup_printf("Disconnected while reading response payload at offset %"PRIuUOFF_T
+		" (wanted %"PRIuUOFF_T"): %s", data->v_offset + data->new_bytes,
+		data->wanted_size, io_stream_get_disconnect_reason(input, NULL));
+}
+
 int http_message_parse_body(struct http_message_parser *parser, bool request)
 {
+	struct istream *input;
+
 	parser->error_code = HTTP_MESSAGE_PARSE_ERROR_NONE;
 	parser->error = NULL;
  
@@ -472,9 +491,14 @@ int http_message_parse_body(struct http_message_parser *parser, bool request)
 		}
 
 		/* Got explicit message size from Content-Length: header */
-		parser->payload =
-			i_stream_create_limit(parser->input,
+		input = i_stream_create_limit(parser->input,
 					      parser->msg.content_length);
+		/* Make sure we return failure if HTTP connection closes before
+		   we've finished reading the full input. */
+		parser->payload = i_stream_create_sized_with_callback(input,
+					parser->msg.content_length,
+					http_istream_error_callback, input);
+		i_stream_unref(&input);
 	} else if (!parser->msg.have_content_length && !request) {
 		/* RFC 7230, Section 3.3.3: Message Body Length
 

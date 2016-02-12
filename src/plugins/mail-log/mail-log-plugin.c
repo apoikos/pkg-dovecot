@@ -11,7 +11,6 @@
 #include "notify-plugin.h"
 #include "mail-log-plugin.h"
 
-#include <stdlib.h>
 
 #define MAILBOX_NAME_LOG_LEN 64
 #define HEADER_LOG_LEN 80
@@ -264,6 +263,8 @@ mail_log_append_mail_message_real(struct mail_log_mail_txn_context *ctx,
 			   this consistently with all mailbox formats */
 			mail_log_append_uid(ctx, msg, text, 0);
 		}
+		/* make sure UID is assigned to this mail */
+		mail->transaction->flags |= MAILBOX_TRANSACTION_FLAG_ASSIGN_UIDS;
 		str_append(text, ", ");
 	}
 	if ((muser->fields & MAIL_LOG_FIELD_MSGID) != 0) {

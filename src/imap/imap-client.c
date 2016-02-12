@@ -6,6 +6,7 @@
 #include "str.h"
 #include "hostpid.h"
 #include "net.h"
+#include "iostream.h"
 #include "istream.h"
 #include "ostream.h"
 #include "time-util.h"
@@ -17,11 +18,11 @@
 #include "mail-error.h"
 #include "mail-namespace.h"
 #include "mail-storage-service.h"
+#include "imap-state.h"
 #include "imap-search.h"
 #include "imap-notify.h"
 #include "imap-commands.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 extern struct mail_storage_callbacks mail_storage_callbacks;
@@ -31,6 +32,15 @@ struct imap_module_register imap_module_register = { 0 };
 
 struct client *imap_clients = NULL;
 unsigned int imap_client_count = 0;
+
+static const char *client_command_state_names[CLIENT_COMMAND_STATE_DONE+1] = {
+	"wait-input",
+	"wait-output",
+	"wait-external",
+	"wait-unambiguity",
+	"wait-sync",
+	"done"
+};
 
 static void client_idle_timeout(struct client *client)
 {
@@ -211,12 +221,19 @@ void client_command_cancel(struct client_command_context **_cmd)
 	}
 }
 
-static const char *client_stats(struct client *client)
+const char *client_stats(struct client *client)
 {
 	static struct var_expand_table static_tab[] = {
 		{ 'i', NULL, "input" },
 		{ 'o', NULL, "output" },
 		{ '\0', NULL, "session" },
+		{ '\0', NULL, "fetch_hdr_count" },
+		{ '\0', NULL, "fetch_hdr_bytes" },
+		{ '\0', NULL, "fetch_body_count" },
+		{ '\0', NULL, "fetch_body_bytes" },
+		{ '\0', NULL, "deleted" },
+		{ '\0', NULL, "expunged" },
+		{ '\0', NULL, "trashed" },
 		{ '\0', NULL, NULL }
 	};
 	struct var_expand_table *tab;
@@ -228,28 +245,83 @@ static const char *client_stats(struct client *client)
 	tab[0].value = dec2str(i_stream_get_absolute_offset(client->input));
 	tab[1].value = dec2str(client->output->offset);
 	tab[2].value = client->session_id;
+	tab[3].value = dec2str(client->fetch_hdr_count);
+	tab[4].value = dec2str(client->fetch_hdr_bytes);
+	tab[5].value = dec2str(client->fetch_body_count);
+	tab[6].value = dec2str(client->fetch_body_bytes);
+	tab[7].value = dec2str(client->deleted_count);
+	tab[8].value = dec2str(client->expunged_count);
+	tab[9].value = dec2str(client->trashed_count);
 
 	str = t_str_new(128);
 	var_expand(str, client->set->imap_logout_format, tab);
 	return str_c(str);
 }
 
-static const char *client_get_disconnect_reason(struct client *client)
-{
-	errno = client->input->stream_errno != 0 ?
-		client->input->stream_errno :
-		client->output->stream_errno;
-	if (errno == 0 || errno == EPIPE)
-		return "Connection closed";
-	return t_strdup_printf("Connection closed: %s",
-			       client->input->stream_errno != 0 ?
-			       i_stream_get_error(client->input) :
-			       o_stream_get_error(client->output));
-}
-
 void client_destroy(struct client *client, const char *reason)
 {
 	client->v.destroy(client, reason);
+}
+
+static const char *client_get_commands_status(struct client *client)
+{
+	struct client_command_context *cmd, *last_cmd = NULL;
+	unsigned int msecs_in_ioloop;
+	uint64_t running_usecs = 0, ioloop_wait_usecs;
+	unsigned long long bytes_in = 0, bytes_out = 0;
+	string_t *str;
+	enum io_condition cond;
+	const char *cond_str;
+
+	if (client->command_queue == NULL)
+		return "";
+
+	str = t_str_new(128);
+	str_append(str, " (");
+	for (cmd = client->command_queue; cmd != NULL; cmd = cmd->next) {
+		str_append(str, cmd->name);
+		if (cmd->next != NULL)
+			str_append_c(str, ',');
+		running_usecs += cmd->running_usecs;
+		bytes_in += cmd->bytes_in;
+		bytes_out += cmd->bytes_out;
+		last_cmd = cmd;
+	}
+
+	cond = io_loop_find_fd_conditions(current_ioloop, client->fd_out);
+	if ((cond & (IO_READ | IO_WRITE)) == (IO_READ | IO_WRITE))
+		cond_str = "input/output";
+	else if ((cond & IO_READ) != 0)
+		cond_str = "input";
+	else if ((cond & IO_WRITE) != 0)
+		cond_str = "output";
+	else
+		cond_str = "nothing";
+
+	ioloop_wait_usecs = io_loop_get_wait_usecs(current_ioloop);
+	msecs_in_ioloop = (ioloop_wait_usecs -
+		last_cmd->start_ioloop_wait_usecs + 999) / 1000;
+	str_printfa(str, " running for %d.%03d + waiting %s for %d.%03d secs",
+		    (int)((running_usecs+999)/1000 / 1000),
+		    (int)((running_usecs+999)/1000 % 1000), cond_str,
+		    msecs_in_ioloop / 1000, msecs_in_ioloop % 1000);
+	str_printfa(str, ", %llu B in + %llu+%"PRIuSIZE_T" B out, state=%s)",
+		    bytes_in, bytes_out,
+		    o_stream_get_buffer_used_size(client->output),
+		    client_command_state_names[last_cmd->state]);
+	return str_c(str);
+}
+
+static void client_log_disconnect(struct client *client, const char *reason)
+{
+	const char *cmd_status = "";
+
+	if (reason == NULL) {
+		reason = io_stream_get_disconnect_reason(client->input,
+							 client->output);
+		cmd_status = client_get_commands_status(client);
+	}
+	i_info("%s%s %s", reason, cmd_status, client_stats(client));
 }
 
 static void client_default_destroy(struct client *client, const char *reason)
@@ -261,9 +333,7 @@ static void client_default_destroy(struct client *client, const char *reason)
 
 	if (!client->disconnected) {
 		client->disconnected = TRUE;
-		if (reason == NULL)
-			reason = client_get_disconnect_reason(client);
-		i_info("%s %s", reason, client_stats(client));
+		client_log_disconnect(client, reason);
 	}
 
 	i_stream_close(client->input);
@@ -297,7 +367,6 @@ static void client_default_destroy(struct client *client, const char *reason)
 			mail_user_get_anvil_userip_ident(client->user),
 			"\n", NULL));
 	}
-	mail_user_unref(&client->user);
 
 	if (client->free_parser != NULL)
 		imap_parser_unref(&client->free_parser);
@@ -315,6 +384,10 @@ static void client_default_destroy(struct client *client, const char *reason)
 	net_disconnect(client->fd_in);
 	if (client->fd_in != client->fd_out)
 		net_disconnect(client->fd_out);
+
+	/* Free the user after client is already disconnected. It may start
+	   some background work like autoexpunging. */
+	mail_user_unref(&client->user);
 
 	if (array_is_created(&client->search_saved_uidset))
 		array_free(&client->search_saved_uidset);
@@ -338,12 +411,10 @@ static void client_destroy_timeout(struct client *client)
 
 void client_disconnect(struct client *client, const char *reason)
 {
-	i_assert(reason != NULL);
-
 	if (client->disconnected)
 		return;
 
-	i_info("Disconnected: %s %s", reason, client_stats(client));
+	client_log_disconnect(client, reason);
 	client->disconnected = TRUE;
 	o_stream_nflush(client->output);
 	o_stream_uncork(client->output);
@@ -391,11 +462,32 @@ int client_send_line_next(struct client *client, const char *data)
 	return 1;
 }
 
+static void
+client_cmd_append_timing_stats(struct client_command_context *cmd,
+			       string_t *str)
+{
+	unsigned int msecs_in_cmd, msecs_in_ioloop;
+	uint64_t ioloop_wait_usecs;
+
+	if (cmd->start_time.tv_sec == 0)
+		return;
+
+	ioloop_wait_usecs = io_loop_get_wait_usecs(current_ioloop);
+	msecs_in_cmd = (cmd->running_usecs + 999) / 1000;
+	msecs_in_ioloop = (ioloop_wait_usecs -
+			   cmd->start_ioloop_wait_usecs + 999) / 1000;
+
+	if (str_data(str)[str_len(str)-1] == '.')
+		str_truncate(str, str_len(str)-1);
+	str_printfa(str, " (%d.%03d + %d.%03d secs).",
+		    msecs_in_cmd / 1000, msecs_in_cmd % 1000,
+		    msecs_in_ioloop / 1000, msecs_in_ioloop % 1000);
+}
+
 void client_send_tagline(struct client_command_context *cmd, const char *data)
 {
 	struct client *client = cmd->client;
 	const char *tag = cmd->tag;
-	int time_msecs;
 
 	if (client->output->closed || cmd->cancel)
 		return;
@@ -409,18 +501,7 @@ void client_send_tagline(struct client_command_context *cmd, const char *data)
 	T_BEGIN {
 		string_t *str = t_str_new(256);
 		str_printfa(str, "%s %s", tag, data);
-		if (cmd->start_time.tv_sec != 0) {
-			if (str_data(str)[str_len(str)-1] == '.')
-				str_truncate(str, str_len(str)-1);
-			io_loop_time_refresh();
-			time_msecs = timeval_diff_msecs(&ioloop_timeval,
-							&cmd->start_time);
-			time_msecs -= cmd->usecs_in_ioloop/1000;
-			if (time_msecs >= 0) {
-				str_printfa(str, " (%d.%03d secs).",
-					    time_msecs/1000, time_msecs%1000);
-			}
-		}
+		client_cmd_append_timing_stats(cmd, str);
 		str_append(str, "\r\n");
 		o_stream_nsend(client->output, str_data(str), str_len(str));
 	} T_END;
@@ -491,6 +572,8 @@ bool client_read_args(struct client_command_context *cmd, unsigned int count,
 		imap_write_args(str, *args_r);
 		cmd->args = p_strdup(cmd->pool, str_c(str));
 		cmd->start_time = ioloop_timeval;
+		cmd->start_ioloop_wait_usecs =
+			io_loop_get_wait_usecs(current_ioloop);
 
 		cmd->client->input_lock = NULL;
 		return TRUE;
@@ -651,7 +734,7 @@ client_command_new(struct client *client)
 	return cmd;
 }
 
-static void client_add_missing_io(struct client *client)
+void client_add_missing_io(struct client *client)
 {
 	if (client->io == NULL && !client->disconnected)
 		client->io = io_add_istream(client->input, client_input, client);
@@ -685,11 +768,13 @@ void client_command_free(struct client_command_context **_cmd)
 	if (client->mailbox_change_lock == cmd)
 		client->mailbox_change_lock = NULL;
 
-	if (client->free_parser == NULL) {
-		imap_parser_reset(cmd->parser);
-		client->free_parser = cmd->parser;
-	} else if (cmd->parser != NULL) {
-		imap_parser_unref(&cmd->parser);
+	if (cmd->parser != NULL) {
+		if (client->free_parser == NULL) {
+			imap_parser_reset(cmd->parser);
+			client->free_parser = cmd->parser;
+		} else {
+			imap_parser_unref(&cmd->parser);
+		}
 	}
 
 	client->command_queue_size--;
@@ -718,37 +803,85 @@ void client_command_free(struct client_command_context **_cmd)
 	}
 }
 
-void client_continue_pending_input(struct client *client)
+static void client_check_command_hangs(struct client *client)
 {
-	i_assert(!client->handling_input);
+	struct client_command_context *cmd;
+	unsigned int unfinished_count = 0;
+	bool have_wait_unfinished = FALSE;
 
+	for (cmd = client->command_queue; cmd != NULL; cmd = cmd->next) {
+		switch (cmd->state) {
+		case CLIENT_COMMAND_STATE_WAIT_INPUT:
+			i_assert(client->io != NULL);
+			unfinished_count++;
+			break;
+		case CLIENT_COMMAND_STATE_WAIT_OUTPUT:
+			i_assert((io_loop_find_fd_conditions(current_ioloop, client->fd_out) & IO_WRITE) != 0);
+			unfinished_count++;
+			break;
+		case CLIENT_COMMAND_STATE_WAIT_EXTERNAL:
+			unfinished_count++;
+			break;
+		case CLIENT_COMMAND_STATE_WAIT_UNAMBIGUITY:
+			have_wait_unfinished = TRUE;
+			break;
+		case CLIENT_COMMAND_STATE_WAIT_SYNC:
+			if ((io_loop_find_fd_conditions(current_ioloop, client->fd_out) & IO_WRITE) == 0)
+				have_wait_unfinished = TRUE;
+			else {
+				/* we have an output callback, which will be
+				   called soon and it'll run cmd_sync_delayed().
+				   FIXME: is this actually wanted? */
+			}
+			break;
+		case CLIENT_COMMAND_STATE_DONE:
+			i_unreached();
+		}
+	}
+	i_assert(!have_wait_unfinished || unfinished_count > 0);
+}
+
+static bool client_remove_pending_unambiguity(struct client *client)
+{
 	if (client->input_lock != NULL) {
 		/* there's a command that has locked the input */
 		struct client_command_context *cmd = client->input_lock;
 
 		if (cmd->state != CLIENT_COMMAND_STATE_WAIT_UNAMBIGUITY)
-			return;
+			return FALSE;
 
 		/* the command is waiting for existing ambiguity causing
 		   commands to finish. */
 		if (client_command_is_ambiguous(cmd)) {
 			/* we could be waiting for existing sync to finish */
 			if (!cmd_sync_delayed(client))
-				return;
+				return FALSE;
 			if (client_command_is_ambiguous(cmd))
-				return;
+				return FALSE;
 		}
 		cmd->state = CLIENT_COMMAND_STATE_WAIT_INPUT;
 	}
+	return TRUE;
+}
 
-	client_add_missing_io(client);
+void client_continue_pending_input(struct client *client)
+{
+	i_assert(!client->handling_input);
 
-	/* if there's unread data in buffer, handle it. */
-	if (i_stream_get_data_size(client->input) > 0 &&
-	    !client->disconnected) {
-		if (client_handle_input(client))
-			client_continue_pending_input(client);
+	/* this function is called at the end of I/O callbacks (and only there).
+	   fix up the command states and verify that they're correct. */
+	while (client_remove_pending_unambiguity(client)) {
+		client_add_missing_io(client);
+
+		/* if there's unread data in buffer, handle it. */
+		if (i_stream_get_data_size(client->input) == 0 ||
+		    client->disconnected)
+			break;
+		if (!client_handle_input(client))
+			break;
 	}
+	if (!client->input->closed && !client->output->closed)
+		client_check_command_hangs(client);
 }
 
 /* Skip incoming data until newline is found,
@@ -935,8 +1068,13 @@ bool client_handle_input(struct client *client)
 	if (!handled_commands)
 		return FALSE;
 
-	if (client->input_lock == NULL)
+	if (client->input_lock == NULL) {
+		/* finished handling all commands. sync them all at once now. */
 		cmd_sync_delayed(client);
+	} else if (client->input_lock->state == CLIENT_COMMAND_STATE_WAIT_UNAMBIGUITY) {
+		/* the command may be waiting for previous command to sync. */
+		cmd_sync_delayed(client);
+	}
 	return TRUE;
 }
 
@@ -1054,7 +1192,7 @@ int client_output(struct client *client)
 
 	o_stream_uncork(client->output);
 	imap_refresh_proctitle();
-	if (client->disconnected)
+	if (client->output->closed)
 		client_destroy(client, NULL);
 	else
 		client_continue_pending_input(client);
@@ -1157,5 +1295,7 @@ void clients_destroy_all(struct mail_storage_service_ctx *storage_service)
 }
 
 struct imap_client_vfuncs imap_client_vfuncs = {
+	imap_state_export_base,
+	imap_state_import_base,
 	client_default_destroy
 };

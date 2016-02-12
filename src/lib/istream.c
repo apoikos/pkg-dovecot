@@ -6,6 +6,8 @@
 #include "str.h"
 #include "istream-private.h"
 
+static bool i_stream_is_buffer_invalid(const struct istream_private *stream);
+
 void i_stream_set_name(struct istream *stream, const char *name)
 {
 	i_free(stream->real_stream->iostream.name);
@@ -184,6 +186,9 @@ ssize_t i_stream_read(struct istream *stream)
 	}
 
 	i_stream_update(_stream);
+	/* verify that parents' access_counters are valid. the parent's
+	   i_stream_read() should guarantee this. */
+	i_assert(!i_stream_is_buffer_invalid(_stream));
 	return ret;
 }
 
@@ -767,8 +772,10 @@ i_stream_default_stat(struct istream_private *stream, bool exact)
 	if (stream->parent == NULL)
 		return stream->istream.stream_errno == 0 ? 0 : -1;
 
-	if (i_stream_stat(stream->parent, exact, &st) < 0)
+	if (i_stream_stat(stream->parent, exact, &st) < 0) {
+		stream->istream.stream_errno = stream->parent->stream_errno;
 		return -1;
+	}
 	stream->statbuf = *st;
 	if (exact && !stream->stream_size_passthrough) {
 		/* exact size is not known, even if parent returned something */
@@ -781,8 +788,10 @@ static int
 i_stream_default_get_size(struct istream_private *stream,
 			  bool exact, uoff_t *size_r)
 {
-	if (stream->stat(stream, exact) < 0)
+	if (stream->stat(stream, exact) < 0) {
+		stream->istream.stream_errno = stream->parent->stream_errno;
 		return -1;
+	}
 	if (stream->statbuf.st_size == -1)
 		return 0;
 
